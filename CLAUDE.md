@@ -89,7 +89,7 @@ That must print nothing.
 ```
 encoder/incoder.c   sensor behaviour: position, zero point, timestamp, PV/ZPD
       ↑
-ssi/ssi4.c          SSI4 frame codec — pure logic, no hardware, host-testable
+ssi/ssi_variant.c   SSI payload codecs — pure logic, no hardware, host-testable
       ↑
 ssi/ssi_slave.c     generic SSI slave transport (SPI1 + DMA + Tmu gap)
 ```

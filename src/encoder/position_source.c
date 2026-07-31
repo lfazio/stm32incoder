@@ -1,6 +1,6 @@
 #include "encoder/position_source.h"
 #include "board/board.h"
-#include "ssi/ssi4.h"
+#include "ssi/ssi_variant.h"
 
 /* The IncOder specifies an "Internal Position Update Period" of < 0.1 ms for
  * all digital comms options (Product Guide 4.12). We run the acquisition at
@@ -19,8 +19,8 @@
 /* The ADC is 12-bit; the position field is 19 or 22 bits depending on variant,
  * so full scale is reached by shifting left. Either way the analog resolution
  * stays 12-bit -- the extra field width does not create information. */
-static uint8_t  s_pos_bits = SSI4_POSITION_BITS;
-static uint32_t s_pos_mask = SSI4_POSITION_MAX;
+static uint8_t  s_pos_bits;
+static uint32_t s_pos_mask;
 
 void position_source_set_width(uint8_t bits)
 {
@@ -115,6 +115,9 @@ void DMA2_Stream0_IRQHandler(void)
 
 void position_source_init(void)
 {
+    /* Until a variant is selected, use the default one's position width. */
+    position_source_set_width(ssi_variant_position_bits(SSI_VARIANT_DEFAULT));
+
     tim_init();
     adc_init();
 }

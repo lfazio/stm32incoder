@@ -12,7 +12,7 @@
 #include "board/trace.h"
 #include "encoder/incoder.h"
 #include "encoder/position_source.h"
-#include "ssi/ssi4.h"
+#include "ssi/ssi_variant.h"
 #include "ssi/ssi_master.h"
 #include "ssi/ssi_slave.h"
 
@@ -37,7 +37,7 @@ int main(void)
     ssi_master_init();
 
     const ssi_slave_config_t ssi_cfg = {
-        .n_bits = SSI4_FRAME_BITS,   /* 32 */
+        .n_bits = ssi_variant_frame_bits(SSI_VARIANT_DEFAULT),
         .tmu_us = 20u,               /* Tmu = 20 us +/- 1 us (5.4.1) */
     };
     if (!ssi_slave_init(&ssi_cfg, incoder_ssi_provider, NULL)) {

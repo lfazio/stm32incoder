@@ -1,6 +1,5 @@
 #include "encoder/incoder.h"
 #include "encoder/position_source.h"
-#include "ssi/ssi4.h"
 #include "board/board.h"
 
 /* Time Stamp counter: "a continuously incrementing counter in the range
@@ -13,7 +12,6 @@
  * Nothing reads it but the update tick, and it free-runs entirely in hardware.
  */
 #define TS_TIM        TIM7
-#define TS_TICK_HZ    (1000000u / SSI4_TIMESTAMP_TICK_US)   /* 100 kHz */
 
 static volatile uint32_t s_position;
 static volatile uint16_t s_timestamp;
@@ -29,14 +27,14 @@ static void timestamp_timer_init(void)
     uint16_t tick_us = ssi_variant_ts_tick_us(s_variant);
 
     if (tick_us == 0u) {
-        tick_us = SSI4_TIMESTAMP_TICK_US;   /* variant carries no TS; keep it running */
+        tick_us = SSI_TIMESTAMP_TICK_US;   /* variant carries no TS; keep it running */
     }
 
     __HAL_RCC_TIM7_CLK_ENABLE();
 
     TS_TIM->CR1  = 0;
     TS_TIM->PSC  = (uint16_t)((APB1_TIMCLK_HZ / 1000000u) * tick_us - 1u);
-    TS_TIM->ARR  = SSI4_TIMESTAMP_MAX;                   /* 2047 */
+    TS_TIM->ARR  = SSI_TIMESTAMP_MAX;                   /* 2047 */
     TS_TIM->EGR  = TIM_EGR_UG;
     TS_TIM->SR   = 0;
     TS_TIM->DIER = 0;
@@ -77,7 +75,7 @@ void incoder_init(void)
 
 uint16_t incoder_timestamp_now(void)
 {
-    return (uint16_t)(TS_TIM->CNT & SSI4_TIMESTAMP_MAX);
+    return (uint16_t)(TS_TIM->CNT & SSI_TIMESTAMP_MAX);
 }
 
 void incoder_update(void)

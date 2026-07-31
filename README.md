@@ -464,14 +464,14 @@ Layered so the SSI transport can be reused for the other SSI payload variants:
 ```
 encoder/incoder.c        sensor behaviour: position, zero point, timestamp, PV/ZPD
         ↑
-ssi/ssi4.c               SSI4 frame codec — pure logic, no hardware
+ssi/ssi_variant.c        SSI payload codecs — pure logic, no hardware
         ↑
 ssi/ssi_slave.c          generic SSI slave transport (SPI1 + DMA + Tmu gap)
 ```
 
 "Generic" here means **payload-agnostic, not hardware-agnostic**: `ssi_slave`
 moves *n* bits and knows nothing of their meaning, so SSI1/2/6/9 (all
-byte-aligned) can be added as further codecs beside `ssi4.c`. It is still
+byte-aligned) live as further codecs in `ssi_variant.c`. It is still
 specifically the SPI1-based transport — porting to another peripheral means
 editing it, not swapping a back end.
 

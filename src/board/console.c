@@ -3,7 +3,6 @@
 #include "board/trace.h"
 #include "encoder/incoder.h"
 #include "encoder/position_source.h"
-#include "ssi/ssi4.h"
 #include "ssi/ssi_master.h"
 #include "ssi/ssi_slave.h"
 #include "ssi/ssi_variant.h"
@@ -116,12 +115,13 @@ void console_banner(void)
                  (unsigned long)(SYSCLK_HZ / 1000000u),
                  board_clock_source_name(),
                  board_timestamp_in_spec() ? "" : "  [timestamp OUT OF SPEC]");
-    trace_printf("SSI slave: CLK=PB3(D3) DATA=PB4(D5)   n=%u bits, Tmu=20us\r\n",
-                 (unsigned)SSI4_FRAME_BITS);
+    trace_printf("SSI slave: CLK=PB3(D3) DATA=PB4(D5)   %s, n=%u bits, Tmu=20us\r\n",
+                 ssi_variant_name(incoder_variant()),
+                 (unsigned)ssi_variant_frame_bits(incoder_variant()));
     trace_printf("SSI master(test): CLK=PB10(D6) DATA=PB14(CN10-28) @ %lu Hz\r\n",
                  (unsigned long)ssi_master_exact_hz());
     trace_printf("angle in : PA0 (A0), 0..VDDA -> 0..%lu counts\r\n",
-                 (unsigned long)SSI4_POSITION_MAX);
+                 (unsigned long)((1u << ssi_variant_position_bits(incoder_variant())) - 1u));
     trace_printf("type 'help' for commands\r\n");
 }
 
@@ -133,8 +133,7 @@ static void cmd_help(void)
     trace_printf("  help                 this list\r\n");
     trace_printf("  stat                 encoder + link state\r\n");
     trace_printf("  src adc|fixed|ramp   position source; adc is the default\r\n");
-    trace_printf("  fixed <counts>       fixed position 0..%lu, selects 'fixed'\r\n",
-                 (unsigned long)SSI4_POSITION_MAX);
+    trace_printf("  fixed <counts>       fixed position, width follows the variant\r\n");
     trace_printf("  ramp <step>          counts per 100us update, selects 'ramp'\r\n");
     trace_printf("  zero set|reset       zero point; reset restores factory (ZPD=1)\r\n");
     trace_printf("  err on|off           force PV=0; makes D31 a meaningful test bit\r\n");
@@ -303,7 +302,8 @@ static void handle_line(char *line)
         }
         position_source_set_fixed(v);
         position_source_select(POS_SRC_FIXED);
-        trace_printf("fixed = %lu\r\n", (unsigned long)(v & SSI4_POSITION_MAX));
+        uint32_t mask = (1u << ssi_variant_position_bits(incoder_variant())) - 1u;
+        trace_printf("fixed = %lu\r\n", (unsigned long)(v & mask));
     } else if (strcmp(cmd, "ramp") == 0 && arg != NULL) {
         int32_t step;
         if (!parse_i32(arg, &step)) {

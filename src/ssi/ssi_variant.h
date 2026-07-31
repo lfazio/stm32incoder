@@ -36,6 +36,14 @@ typedef enum {
 
 #define SSI_VARIANT_DEFAULT  SSI_VARIANT_4
 
+/* Both SSI4 and SSI9 carry an 11-bit Time Stamp spanning 2048 steps; only the
+ * step size differs (10 us against 1 us), which is why the tick lives in the
+ * descriptor table while the width does not. Range is therefore 0.00 ms to
+ * 20.47 ms for SSI4 and 0.00 ms to 2.047 ms for SSI9, as 5.4.2 specifies. */
+#define SSI_TIMESTAMP_BITS      11u
+#define SSI_TIMESTAMP_MAX       ((1u << SSI_TIMESTAMP_BITS) - 1u)  /* 2047 */
+#define SSI_TIMESTAMP_TICK_US   10u   /* fallback for variants without a TS */
+
 /* What the sensor knows, before any variant decides how to lay it out. */
 typedef struct {
     bool     pv;   /* position valid; the ERROR FLAG is its inverse */

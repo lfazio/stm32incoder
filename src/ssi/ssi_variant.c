@@ -1,5 +1,4 @@
 #include "ssi/ssi_variant.h"
-#include "ssi/ssi4.h"
 
 #include <string.h>
 
@@ -97,13 +96,14 @@ uint32_t ssi_variant_pack(ssi_variant_t v, const ssi_sample_t *s)
 
     case SSI_VARIANT_4:
     case SSI_VARIANT_9:
-    default: {
+    default:
         /* Identical layout; only the Time Stamp resolution differs, and that
-         * lives in the counter feeding it, not in the encoding. */
-        ssi4_frame_t f = { .pv = s->pv, .zpd = s->zpd,
-                           .pd = s->pd, .ts = s->ts };
-        return ssi4_pack(&f);
-    }
+         * lives in the counter feeding it, not in the encoding.
+         * D31 PV, D30 ZPD, D29-D11 PD[18:0], D10-D0 TS[10:0]. */
+        return ((uint32_t)(s->pv  ? 1u : 0u) << 31)
+             | ((uint32_t)(s->zpd ? 1u : 0u) << 30)
+             | ((s->pd & 0x7FFFFu) << 11)
+             | ((uint32_t)s->ts & SSI_TIMESTAMP_MAX);
     }
 }
 
@@ -133,15 +133,12 @@ void ssi_variant_unpack(ssi_variant_t v, uint32_t raw, ssi_sample_t *s)
 
     case SSI_VARIANT_4:
     case SSI_VARIANT_9:
-    default: {
-        ssi4_frame_t f;
-        ssi4_unpack(raw, &f);
-        s->pv  = f.pv;
-        s->zpd = f.zpd;
-        s->pd  = f.pd;
-        s->ts  = f.ts;
+    default:
+        s->pv  = (raw >> 31) & 1u;
+        s->zpd = (raw >> 30) & 1u;
+        s->pd  = (raw >> 11) & 0x7FFFFu;
+        s->ts  = (uint16_t)(raw & SSI_TIMESTAMP_MAX);
         break;
-    }
     }
 }
 
