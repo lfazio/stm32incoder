@@ -510,12 +510,3 @@ at a time, and the timer engine restores the pin afterwards.
   "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
-- The first Read Cycle after a state change carries the **previous** value —
-  exactly one cycle, measured. It is not an error and not corruption: the frame
-  is well formed, `pv` and `zpd` correct, simply staged before the change landed.
-  See "One-cycle data latency is intentional"; `read` twice, or use `burst`,
-  which skips warm-up cycles.
-
-  Do not confuse this with the *malformed* opening frame this project used to
-  show. That one was the stranded transmit byte and is fixed — the PV=1 capture
-  is now 200/200 including the first cycle.
