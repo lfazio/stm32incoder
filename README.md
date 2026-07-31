@@ -83,6 +83,7 @@ terminated; `printf 'stat\r' > /dev/ttyACM0` works while a reader holds the port
 | `ramp <step>` | counts added per 100 µs update; also selects `ramp` |
 | `zero set\|reset` | set the zero point here, or restore the factory one (ZPD=1) |
 | `err on\|off` | force PV=0, reporting the error condition |
+| `ssi 1\|2\|4\|6\|9` | select the payload variant; **SSI4 is the default** |
 | `wire` | loopback jumper continuity self-test |
 | `clk <hz>` | test-master clock, any rate 100 kHz…2 MHz |
 | `read [n]` | run *n* Read Cycles and decode each |
@@ -106,13 +107,52 @@ measured during the last frame.
 | Position source | `adc` — PA0, 0…VDDA mapped to 0…524287 counts |
 | Zero point | factory, so ZPD = 1 |
 | PV | 1 (`err off`) |
-| SSI slave | armed, n = 32 bits, Tmu = 20 µs |
+| SSI payload variant | **SSI4** — n = 32 bits, 19-bit position, 10 µs Time Stamp |
+| SSI slave | armed, Tmu = 20 µs |
 | Test-master clock | **500 kHz** (timer engine) |
 | LD2 | blinks at 1 Hz; hold B1 to stream state |
 
 The emulator is serving Read Cycles from reset — no command is needed to start
 it. The console only changes what it reports and drives the loopback test
 master, which is not part of the emulated device.
+
+## SSI payload variants
+
+The transport moves *n* bits and knows nothing of their meaning, so the payload
+variants are sibling codecs in `ssi/ssi_variant.c`. `ssi <n>` switches between
+them at runtime; it reconfigures the frame length, the position field width and
+the Time Stamp tick, then re-arms.
+
+| Variant | n | Layout (Product Guide 5.4.2) | Position | Time Stamp |
+|---|---|---|---|---|
+| SSI1 | 24 | D23 PV, D22 ZPD, D21-D0 PD | 22 bit | — |
+| SSI2 | 24 | D23-D2 PD, D1 parity, D0 alarm | 22 bit | — |
+| **SSI4** | 32 | D31 PV, D30 ZPD, D29-D11 PD, D10-D0 TS | 19 bit | 10 µs |
+| SSI6 | 32 | D31-D24 CRC-8, D23 PV, D22 ZPD, D21-D0 PD | 22 bit | — |
+| SSI9 | 32 | as SSI4 | 19 bit | 1 µs |
+
+Verified on the wire with `fixed 0x12345`, each decoding back to 74565 and each
+running `burst 100 50` at `ok=98 bad=0`:
+
+```
+ssi1  C12345      PV|ZPD|0x12345
+ssi2  048D16      0x12345<<2, parity 1 (odd), alarm 0
+ssi4  C91A2AA2    PV|ZPD|0x12345<<11|ts
+ssi6  DFC12345    CRC-8 0xDF over the 24-bit body
+ssi9  C91A2B92    as ssi4, TS counting in 1 µs steps
+```
+
+SSI7 (n=30) and SSI8 (n=18) are **not** implemented: they are not byte aligned,
+and `ssi_slave` transfers whole bytes.
+
+**The SSI6 CRC is computed in software, and has to be.** The STM32F446 has a CRC
+peripheral, but RM0390 4.1 describes "a *fixed* generator polynomial" and 4.2
+names it: "CRC-32 (Ethernet) polynomial: 0x4C11DB7". There is no `CRC_POL` or
+`POLYSIZE` register on this family — a programmable polynomial and width arrived
+with F0/F3/L4/H7. SSI6 needs CRC-8 with polynomial 0x97, so the hardware unit
+cannot produce it. The software version is 24 shift/xor steps inside
+`stage_frame()`, which runs in the Tmu handler *after* DATA has already been
+driven high, so it is off both the 250 ns handover path and the Tmu measurement.
 
 ## Loopback testing
 
@@ -496,9 +536,12 @@ at a time, and the timer engine restores the pin afterwards.
 
 ## Known limitations
 
-- `ssi_slave` supports byte-aligned frame lengths only (n = 8/16/24/32), which
-  covers SSI1, SSI2, SSI4, SSI6 and SSI9. SSI7 (n=30) and SSI8 (n=18) would need
-  bit-level padding.
+- `ssi_slave` supports byte-aligned frame lengths only (n = 8/16/24/32). SSI1,
+  SSI2, SSI4, SSI6 and SSI9 are implemented; SSI7 (n=30) and SSI8 (n=18) would
+  need bit-level padding in the transport first.
+- The SSI6 CRC is checked against our own implementation of the guide's
+  parameters, which proves round-trip consistency rather than conformance to an
+  external reference vector.
 - Single-turn only; the multi-turn variants (SSI31/32) are not implemented.
 - The EXTI3 handover has a hard deadline: it must set DATA to the SPI output
   within half a clock period of the first falling edge — 250 ns at the 2 MHz

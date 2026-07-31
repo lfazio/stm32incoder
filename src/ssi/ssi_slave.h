@@ -60,6 +60,10 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
  * message out. */
 void ssi_slave_start(void);
 
+/* Changes the message length, for switching SSI payload variant. Disarms,
+ * reconfigures and re-arms; n_bits must still be a multiple of 8 and <= 32. */
+bool ssi_slave_set_frame_bits(uint8_t n_bits);
+
 /* Recovers from a master that abandoned a Read Cycle part-way through. Call
  * periodically from the main loop; it is a no-op when the link is healthy. */
 void ssi_slave_poll(void);

@@ -94,8 +94,16 @@ ssi/ssi4.c          SSI4 frame codec — pure logic, no hardware, host-testable
 ssi/ssi_slave.c     generic SSI slave transport (SPI1 + DMA + Tmu gap)
 ```
 
-`ssi_slave` is payload-agnostic on purpose: it moves *n* bits so the other SSI
-variants can be added as sibling codecs next to `ssi4.c`. Do not leak SSI4
+`ssi_slave` is payload-agnostic on purpose: it moves *n* bits, and the payload
+variants live as sibling codecs in `ssi/ssi_variant.c` -- SSI1, SSI2, SSI4
+(default), SSI6 and SSI9, selected at runtime with `ssi <n>`. SSI7 and SSI8 are
+absent because they are not byte aligned. Adding a variant means adding a
+pack/unpack there and a row in the descriptor table, nothing else.
+
+SSI6's CRC-8 (polynomial 0x97) cannot use the CRC peripheral: RM0390 4.1/4.2
+give it "a fixed generator polynomial", CRC-32 0x4C11DB7, with no CRC_POL or
+POLYSIZE on this family. It stays in software, in `stage_frame()`, which runs
+after DATA is driven high and so is off both timing-critical paths. Do not leak SSI4
 field knowledge into it, and do not leak SPI/DMA knowledge upward.
 `ssi/ssi_master.c` is a bring-up instrument, not part of the emulated device.
 

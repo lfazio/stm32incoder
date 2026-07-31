@@ -16,8 +16,20 @@
 #define ADC_DMA_STREAM   DMA2_Stream0
 #define ADC_DMA_CHANNEL  0u
 
-/* 12-bit ADC -> 19-bit position field: shift left by 7. */
-#define ADC_TO_POSITION_SHIFT  (SSI4_POSITION_BITS - 12u)
+/* The ADC is 12-bit; the position field is 19 or 22 bits depending on variant,
+ * so full scale is reached by shifting left. Either way the analog resolution
+ * stays 12-bit -- the extra field width does not create information. */
+static uint8_t  s_pos_bits = SSI4_POSITION_BITS;
+static uint32_t s_pos_mask = SSI4_POSITION_MAX;
+
+void position_source_set_width(uint8_t bits)
+{
+    if (bits < 12u || bits > 22u) {
+        return;
+    }
+    s_pos_bits = bits;
+    s_pos_mask = (1u << bits) - 1u;
+}
 
 static ADC_HandleTypeDef s_adc;
 static TIM_HandleTypeDef s_tim;
@@ -138,7 +150,7 @@ const char *position_source_name(position_source_t src)
 
 void position_source_set_fixed(uint32_t counts)
 {
-    s_fixed = counts & SSI4_POSITION_MAX;
+    s_fixed = counts & s_pos_mask;
 }
 
 void position_source_set_ramp_step(int32_t counts_per_update)
@@ -158,7 +170,7 @@ uint16_t position_source_raw_adc(void)
 void position_source_tick(void)
 {
     if (s_src == POS_SRC_RAMP) {
-        s_ramp = (uint32_t)((int32_t)s_ramp + s_ramp_step) & SSI4_POSITION_MAX;
+        s_ramp = (uint32_t)((int32_t)s_ramp + s_ramp_step) & s_pos_mask;
     }
 }
 
@@ -171,8 +183,8 @@ uint32_t position_source_read(void)
         return s_ramp;
     case POS_SRC_ADC:
     default:
-        return ((uint32_t)position_source_raw_adc() << ADC_TO_POSITION_SHIFT)
-               & SSI4_POSITION_MAX;
+        return ((uint32_t)position_source_raw_adc() << (s_pos_bits - 12u))
+               & s_pos_mask;
     }
 }
 

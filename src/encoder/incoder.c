@@ -19,21 +19,49 @@ static volatile uint32_t s_position;
 static volatile uint16_t s_timestamp;
 static volatile bool     s_valid;
 static volatile uint32_t s_updates;
+static ssi_variant_t     s_variant = SSI_VARIANT_DEFAULT;
 static uint32_t          s_zero_offset;
 static bool              s_zero_default = true;
 static volatile bool     s_force_error;
 
 static void timestamp_timer_init(void)
 {
+    uint16_t tick_us = ssi_variant_ts_tick_us(s_variant);
+
+    if (tick_us == 0u) {
+        tick_us = SSI4_TIMESTAMP_TICK_US;   /* variant carries no TS; keep it running */
+    }
+
     __HAL_RCC_TIM7_CLK_ENABLE();
 
     TS_TIM->CR1  = 0;
-    TS_TIM->PSC  = (APB1_TIMCLK_HZ / TS_TICK_HZ) - 1u;   /* 899 */
+    TS_TIM->PSC  = (uint16_t)((APB1_TIMCLK_HZ / 1000000u) * tick_us - 1u);
     TS_TIM->ARR  = SSI4_TIMESTAMP_MAX;                   /* 2047 */
     TS_TIM->EGR  = TIM_EGR_UG;
     TS_TIM->SR   = 0;
     TS_TIM->DIER = 0;
     TS_TIM->CR1  = TIM_CR1_CEN;
+}
+
+bool incoder_set_variant(ssi_variant_t v)
+{
+    if (v >= SSI_VARIANT_COUNT) {
+        return false;
+    }
+    s_variant = v;
+
+    /* The position field width and the Time Stamp resolution both come from
+     * the variant, so retune both before the transport starts moving the new
+     * frame length. */
+    position_source_set_width(ssi_variant_position_bits(v));
+    timestamp_timer_init();
+
+    return ssi_slave_set_frame_bits(ssi_variant_frame_bits(v));
+}
+
+ssi_variant_t incoder_variant(void)
+{
+    return s_variant;
 }
 
 void incoder_init(void)
@@ -56,8 +84,9 @@ void incoder_update(void)
 {
     position_source_tick();
 
-    uint32_t raw = position_source_read();
-    uint32_t pos = (raw - s_zero_offset) & SSI4_POSITION_MAX;
+    uint32_t mask = (1u << ssi_variant_position_bits(s_variant)) - 1u;
+    uint32_t raw  = position_source_read();
+    uint32_t pos  = (raw - s_zero_offset) & mask;
 
     /* Latch position and its timestamp together: TS reports when the position
      * was measured, not when it is transmitted. */
@@ -108,15 +137,15 @@ void incoder_ssi_provider(void *ctx, ssi_slave_frame_t *out)
 {
     (void)ctx;
 
-    ssi4_frame_t f = {
+    ssi_sample_t sample = {
         .pv  = s_valid,
         .zpd = s_zero_default,
         .pd  = s_position,
         .ts  = s_timestamp,
     };
 
-    out->payload = ssi4_pack(&f);
+    out->payload = ssi_variant_pack(s_variant, &sample);
     /* PV is the inverse of the ERROR FLAG (5.4.2), and the ERROR FLAG is what
      * the data line carries during the gap (5.4.1 note 3). */
-    out->error_flag = !f.pv;
+    out->error_flag = !sample.pv;
 }

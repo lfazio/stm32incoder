@@ -24,6 +24,11 @@ typedef enum {
 
 void position_source_init(void);
 
+/* Sets the position field width, which the selected SSI variant decides
+ * (19 bits for SSI4/SSI9, 22 for SSI1/SSI2/SSI6). Rescales the analog mapping
+ * so full scale still means a full revolution. */
+void position_source_set_width(uint8_t bits);
+
 /* Starts the ADC + trigger timer. Safe to call even when another source is
  * selected; the conversions simply go unused. */
 void position_source_start(void);

@@ -6,6 +6,7 @@
 #include "ssi/ssi4.h"
 #include "ssi/ssi_master.h"
 #include "ssi/ssi_slave.h"
+#include "ssi/ssi_variant.h"
 
 #include <string.h>
 
@@ -137,6 +138,7 @@ static void cmd_help(void)
     trace_printf("  ramp <step>          counts per 100us update, selects 'ramp'\r\n");
     trace_printf("  zero set|reset       zero point; reset restores factory (ZPD=1)\r\n");
     trace_printf("  err on|off           force PV=0; makes D31 a meaningful test bit\r\n");
+    trace_printf("  ssi 1|2|4|6|9        payload variant; 4 is the default\r\n");
     trace_printf("test master (loopback only):\r\n");
     trace_printf("  wire                 check the loopback jumpers for continuity\r\n");
     trace_printf("  clk <hz>             clock rate, any value 100k..2M (timer)\r\n");
@@ -154,6 +156,10 @@ static void cmd_stat(void)
     incoder_get_state(&st);
     ssi_slave_get_stats(&ss);
 
+    trace_printf("variant=%s n=%u bits pos=%u bits\r\n",
+                 ssi_variant_name(incoder_variant()),
+                 (unsigned)ssi_variant_frame_bits(incoder_variant()),
+                 (unsigned)ssi_variant_position_bits(incoder_variant()));
     trace_printf("src=%s pos=%lu ts=%u pv=%u zpd=%u updates=%lu\r\n",
                  position_source_name(position_source_get()),
                  (unsigned long)st.position, (unsigned)st.timestamp,
@@ -176,19 +182,22 @@ static void cmd_read(uint32_t count, bool fast)
     }
 
     for (uint32_t i = 0; i < count; i++) {
+        ssi_variant_t v = incoder_variant();
+        uint8_t  n   = ssi_variant_frame_bits(v);
         uint32_t raw = 0;
-        bool ok = fast ? ssi_master_read_timer(SSI4_FRAME_BITS, &raw)
-                       : ssi_master_read(SSI4_FRAME_BITS, &raw);
+        bool ok = fast ? ssi_master_read_timer(n, &raw)
+                       : ssi_master_read(n, &raw);
 
         if (!ok) {
             trace_printf("read %lu: DATA not idle high, aborted\r\n", (unsigned long)i);
         } else {
-            ssi4_frame_t f;
-            ssi4_unpack(raw, &f);
-            trace_printf("read %lu: raw=%08lX pv=%u zpd=%u pd=%lu ts=%u\r\n",
-                         (unsigned long)i, (unsigned long)raw,
+            ssi_sample_t f;
+            ssi_variant_unpack(v, raw, &f);
+            trace_printf("read %lu: raw=%0*lX pv=%u zpd=%u pd=%lu ts=%u %s\r\n",
+                         (unsigned long)i, n / 4, (unsigned long)raw,
                          (unsigned)f.pv, (unsigned)f.zpd,
-                         (unsigned long)f.pd, (unsigned)f.ts);
+                         (unsigned long)f.pd, (unsigned)f.ts,
+                         ssi_variant_check(v, raw) ? "" : "CHECK-FAIL");
         }
         /* Timg must exceed Tmu (20 us); leave clear margin. */
         ssi_master_delay_us(200);
@@ -221,9 +230,10 @@ static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
     const uint32_t warmup = (count > 2u) ? 2u : 0u;
 
     for (uint32_t i = 0; i < count; i++) {
+        ssi_variant_t v = incoder_variant();
         uint32_t raw = 0;
-        bool got = fast ? ssi_master_read_timer(SSI4_FRAME_BITS, &raw)
-                        : ssi_master_read(SSI4_FRAME_BITS, &raw);
+        bool got = fast ? ssi_master_read_timer(ssi_variant_frame_bits(v), &raw)
+                        : ssi_master_read(ssi_variant_frame_bits(v), &raw);
         if (i < warmup) {
             ssi_master_delay_us(gap_us);
             continue;
@@ -231,8 +241,13 @@ static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
         if (!got) {
             bad++;
         } else {
-            ssi4_frame_t f;
-            ssi4_unpack(raw, &f);
+            ssi_sample_t f;
+            ssi_variant_unpack(v, raw, &f);
+            if (!ssi_variant_check(v, raw)) {
+                bad++;
+                ssi_master_delay_us(gap_us);
+                continue;
+            }
             if (!have_first) {
                 first = f.pd;
                 have_first = true;
@@ -368,6 +383,20 @@ static void handle_line(char *line)
             return;
         }
         cmd_burst(n, fast, g);
+    } else if (strcmp(cmd, "ssi") == 0 && arg != NULL) {
+        ssi_variant_t v;
+        if (!ssi_variant_from_name(arg, &v)) {
+            trace_printf("unknown variant '%s' (try 1, 2, 4, 6, 9)\r\n", arg);
+            return;
+        }
+        if (!incoder_set_variant(v)) {
+            trace_printf("variant %s rejected\r\n", ssi_variant_name(v));
+            return;
+        }
+        trace_printf("variant = %s, n = %u bits, position %u bits\r\n",
+                     ssi_variant_name(v),
+                     (unsigned)ssi_variant_frame_bits(v),
+                     (unsigned)ssi_variant_position_bits(v));
     } else if (strcmp(cmd, "err") == 0 && arg != NULL) {
         incoder_force_error(strcmp(arg, "on") == 0);
         trace_printf("force error = %u (PV will read %u)\r\n",

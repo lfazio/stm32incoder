@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include "ssi/ssi_slave.h"
+#include "ssi/ssi_variant.h"
 
 typedef struct {
     uint32_t position;    /* 19-bit, zero-point corrected */
@@ -30,6 +31,11 @@ typedef struct {
 } incoder_state_t;
 
 void incoder_init(void);
+
+/* Selects the SSI payload variant. Reconfigures the transport's frame length,
+ * the position field width and the Time Stamp tick, then re-arms. */
+bool          incoder_set_variant(ssi_variant_t v);
+ssi_variant_t incoder_variant(void);
 
 /* Latches a new position together with its timestamp. Called from the 100 us
  * update tick. */

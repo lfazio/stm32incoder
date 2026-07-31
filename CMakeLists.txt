@@ -58,6 +58,7 @@ add_executable(simenc.elf
     src/ssi/ssi_slave.c
     src/ssi/ssi_master.c
     src/ssi/ssi4.c
+    src/ssi/ssi_variant.c
     src/encoder/incoder.c
     src/encoder/position_source.c
     ${HAL_SOURCES}

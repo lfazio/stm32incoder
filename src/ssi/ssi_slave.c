@@ -383,6 +383,25 @@ void ssi_slave_start(void)
     ssi_arm();
 }
 
+bool ssi_slave_set_frame_bits(uint8_t n_bits)
+{
+    if (n_bits == 0u || n_bits > 32u || (n_bits % 8u) != 0u) {
+        return false;
+    }
+
+    /* Stop the gap timer first: its handler re-arms, and it must not fire
+     * between the config change and the fresh arm below. */
+    GAP_TIM->CR1 &= ~TIM_CR1_CEN;
+    GAP_TIM->SR   = 0;
+    EXTI->IMR    &= ~SSI_SLAVE_SCK_PIN;
+
+    s_cfg.n_bits = n_bits;
+    s_nbytes     = (uint8_t)(n_bits / 8u);
+
+    ssi_slave_start();
+    return true;
+}
+
 void ssi_slave_poll(void)
 {
     if (!s_armed) {
