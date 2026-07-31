@@ -189,6 +189,14 @@ Watch integer truncation in that arithmetic: `1000/(SYSCLK_HZ/1000000)` is 5,
 not 5.56, which reported every period 10% short until it was caught against the
 analyser. Scale before dividing.
 
+Do not extend SSI_RAMFUNC beyond EXTI3_IRQHandler. Putting the end-of-frame DMA
+handler, the Tmu timer handler, stage_frame and ssi_arm in SRAM as well was
+measured and is worse: Error Flag latency 0.64 -> 0.71 us, Tmu 19.89 -> 20.03 us,
+and +568 bytes of RAM. SRAM trades mean speed for determinism, which only pays
+where a hard deadline makes the tail matter. The end-of-frame path is
+compensated and has ~10x margin, so its mean is what counts. The test master
+needs nothing -- its clock is TIM1 compare events driving DMA.
+
 Still to do: the same run through two MAX490 modules at RS-422.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper

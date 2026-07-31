@@ -278,6 +278,25 @@ improvement, not a fix that makes 2 MHz safe by a wide margin.
 
 Build the comparison yourself with `-DSIMENC_RAMFUNC=OFF`.
 
+**Only `EXTI3_IRQHandler` belongs in SRAM.** Moving the rest of the SSI path
+there too — the end-of-frame DMA handler, the Tmu timer handler, `stage_frame`
+and `ssi_arm` — was measured and is *worse*:
+
+| | Error Flag latency | Tmu | RAM |
+|---|---|---|---|
+| EXTI3 only (shipping) | **0.64 µs** mean, 0.71 max | 19.89 µs | 6472 B |
+| Whole path in SRAM | 0.71 µs mean, 0.75 max | 20.03 µs | 7040 B |
+
+That is the same effect seen above, pointing the other way: SRAM trades mean
+speed for determinism. The handover needs the tail bounded because it has a hard
+250 ns deadline, so it wins there. The end-of-frame path has no hard deadline —
+its latency is compensated, and its jitter is ~±0.1 µs against a ±1 µs Tmu
+window — so the mean is what matters and flash is quicker. It would also cost
+568 bytes of RAM and force `GAP_ISR_OVERHEAD_NS` to be re-tuned.
+
+The test master needs nothing: its 2 MHz clock comes from TIM1 compare events
+driving DMA, with software out of the loop entirely.
+
 ## Architecture
 
 Layered so the SSI transport can be reused for the other SSI payload variants:
