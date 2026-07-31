@@ -50,6 +50,7 @@ typedef struct {
 typedef struct {
     uint32_t frames;     /* completed Read Cycles */
     uint32_t resyncs;    /* frames abandoned mid-message and re-armed */
+    uint32_t period_ns;  /* master clock period measured during the last frame */
 } ssi_slave_stats_t;
 
 bool ssi_slave_init(const ssi_slave_config_t *cfg,

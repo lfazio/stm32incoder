@@ -177,6 +177,18 @@ the worst-case margin from 7.2% to 10.4%. Re-measure with -DSIMENC_RAMFUNC=OFF
 before changing anything here; roughly 200 ns of the budget is interrupt entry
 and EXTI propagation, not the three-register handler body.
 
+The Tmu correction is dynamic. Do not replace it with a constant: the
+half-clock-period term ranges from 0.25 us at 2 MHz to 5 us at 100 kHz, and a
+constant tuned at one end puts the other outside the 20 us +/- 1 us window. T is
+measured from the receive DMA's half-transfer to transfer-complete interval,
+which costs nothing in EXTI3_IRQHandler. Verified 19.69 us at 2 MHz and 20.04 us
+at 175.8 kHz. When changing anything in that path, re-tune GAP_ISR_OVERHEAD_NS
+against a capture -- adding the measurement itself moved it from 0.75 to 1.6 us.
+
+Watch integer truncation in that arithmetic: `1000/(SYSCLK_HZ/1000000)` is 5,
+not 5.56, which reported every period 10% short until it was caught against the
+analyser. Scale before dividing.
+
 Still to do: the same run through two MAX490 modules at RS-422.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper

@@ -39,25 +39,28 @@
 #define SSI_TX_CLEAR_FLAGS (DMA_LIFCR_CTCIF3 | DMA_LIFCR_CHTIF3 | DMA_LIFCR_CTEIF3 | \
                             DMA_LIFCR_CDMEIF3 | DMA_LIFCR_CFEIF3)
 
-/* Tmu gap timer. TIM6 is a basic timer on APB1; with the APB1 prescaler != 1
- * its clock is 2 x PCLK1 = 90 MHz, so a prescaler of 90 gives a 1 us tick.
- *
- * The gap does not start exactly at the reference the specification uses. Tmu
- * is measured "from last falling edge of clock", but end-of-message is detected
- * by the receive DMA, which completes on the last *rising* edge -- half a clock
- * period later -- and the interrupt then takes time to reach gap_timer_start().
- *
- * A logic-analyser capture at 2 MHz measured 21.01 us mean from the last
- * falling edge, against the specified 20 us +/- 1 us. Subtracting one tick
- * centres it. The residual term is the half clock period, which the emulator
- * cannot know: it is 0.25 us at 2 MHz but 5 us at the 100 kHz lower limit, so
- * Tmu drifts long as the master's clock slows. See README "Measured against
- * the specification".
+/* Tmu gap timer, TIM6, a basic timer on APB1 (90 MHz with the APB1 prescaler
+ * != 1). The gap it times is corrected for two things, because it does not
+ * start at the reference the specification uses -- see the half-period note by
+ * s_period_ns below, and GAP_ISR_OVERHEAD_NS.
  */
 #define GAP_TIM         TIM6
 #define GAP_TIM_IRQn    TIM6_DAC_IRQn
-#define GAP_TICK_PER_US 1u
-#define GAP_OVERHEAD_US 1u
+
+/* 0.1 us tick, so the half-period correction below can be applied with better
+ * than microsecond resolution. */
+#define GAP_TICK_NS     100u
+#define GAP_TIM_HZ      (1000000000u / GAP_TICK_NS)
+
+/* Fixed part of the correction: interrupt latency from the last rising edge to
+ * gap_timer_start(), plus the latency from the gap timer's update to DATA
+ * actually going high. Measured at ~1.6 us, from two captures that agree --
+ * 20.89 us at 2 MHz (half period 0.25 us) and 20.85 us at 175.8 kHz (half
+ * period 2.89 us), each against a 20 us target. */
+#define GAP_ISR_OVERHEAD_NS  1600u
+
+/* Lower bound, so a pathologically slow master cannot drive the gap to zero. */
+#define GAP_MIN_NS           1000u
 
 static ssi_slave_config_t    s_cfg;
 static ssi_slave_provider_t  s_provider;
@@ -72,6 +75,24 @@ static volatile uint32_t     s_frames;
 static volatile uint32_t     s_resyncs;
 static volatile bool         s_gap_level;
 static volatile uint32_t     s_moder_af;
+
+/* Dynamic half-period correction.
+ *
+ * Tmu is specified "from last falling edge of clock", but end of message is
+ * detected by the receive DMA, which completes on the last *rising* edge --
+ * half a clock period later. That term is 0.25 us at the 2 MHz maximum but
+ * 5 us at the 100 kHz minimum, so a fixed compensation only holds near the top
+ * of the range: below roughly 400 kHz a fixed value pushes Tmu outside its
+ * 20 us +/- 1 us window.
+ *
+ * T is measured without touching EXTI3_IRQHandler, which has only ~26 ns of
+ * margin. The receive DMA's half-transfer event fires exactly n_bits/2 clocks
+ * before transfer-complete, and both run in non-critical handlers, so the two
+ * cycle counts give T for free:  T = (t_TC - t_HT) / (n_bits/2).
+ */
+static volatile uint32_t     s_t_half;         /* DWT cycles at half transfer */
+static volatile uint32_t     s_period_ns;      /* measured clock period T */
+static volatile bool         s_period_valid;
 
 /* --- DATA line ownership --------------------------------------------------
  * PB4 alternates between the SPI (which shifts message bits out of it) and
@@ -259,7 +280,7 @@ static void dma_init(void)
     SSI_RX_STREAM->CR  = (SSI_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
                        | DMA_SxCR_MINC
                        | DMA_SxCR_PL_0 | DMA_SxCR_PL_1  /* very high */
-                       | DMA_SxCR_TCIE;
+                       | DMA_SxCR_TCIE | DMA_SxCR_HTIE;
     SSI_RX_STREAM->FCR = 0;
 
     HAL_NVIC_SetPriority(SSI_RX_IRQn, 0, 1);
@@ -271,8 +292,8 @@ static void gap_timer_init(void)
     __HAL_RCC_TIM6_CLK_ENABLE();
 
     GAP_TIM->CR1 = 0;
-    GAP_TIM->PSC = (APB1_TIMCLK_HZ / 1000000u) - 1u;   /* 1 us per tick */
-    GAP_TIM->ARR = ((s_cfg.tmu_us - GAP_OVERHEAD_US) * GAP_TICK_PER_US) - 1u;
+    GAP_TIM->PSC = (APB1_TIMCLK_HZ / GAP_TIM_HZ) - 1u;   /* 0.1 us per tick */
+    GAP_TIM->ARR = (s_cfg.tmu_us * 1000u) / GAP_TICK_NS; /* replaced per frame */
     GAP_TIM->EGR = TIM_EGR_UG;      /* load PSC/ARR */
     GAP_TIM->SR  = 0;               /* UG set UIF; drop it */
     GAP_TIM->CR1 = TIM_CR1_OPM;     /* one pulse: stops itself at update */
@@ -282,8 +303,22 @@ static void gap_timer_init(void)
     HAL_NVIC_EnableIRQ(GAP_TIM_IRQn);
 }
 
-static inline void gap_timer_start(void)
+/* Programs the gap so that DATA returns HIGH one Tmu after the last *falling*
+ * edge, given the clock period measured during this frame. */
+SSI_RAMFUNC static void gap_timer_start(void)
 {
+    uint32_t want = s_cfg.tmu_us * 1000u;
+    uint32_t sub  = GAP_ISR_OVERHEAD_NS;
+
+    if (s_period_valid) {
+        sub += s_period_ns / 2u;          /* the half clock period */
+    } else {
+        sub += 250u;                      /* first frame: assume 2 MHz */
+    }
+
+    uint32_t ns = (want > sub + GAP_MIN_NS) ? (want - sub) : GAP_MIN_NS;
+
+    GAP_TIM->ARR = (ns / GAP_TICK_NS) - 1u;
     GAP_TIM->CNT = 0;
     GAP_TIM->SR  = 0;
     GAP_TIM->CR1 |= TIM_CR1_CEN;
@@ -304,6 +339,11 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     s_frames   = 0;
     s_resyncs  = 0;
     s_armed    = false;
+
+    /* Cycle counter, used to measure the master's clock period. */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    s_period_valid = false;
 
     gpio_init();
     spi_init();
@@ -344,8 +384,9 @@ void ssi_slave_poll(void)
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out)
 {
-    out->frames  = s_frames;
-    out->resyncs = s_resyncs;
+    out->frames    = s_frames;
+    out->resyncs   = s_resyncs;
+    out->period_ns = s_period_valid ? s_period_ns : 0u;
 }
 
 /* --- interrupts ----------------------------------------------------------- */
@@ -375,8 +416,30 @@ SSI_RAMFUNC void EXTI3_IRQHandler(void)
 /* End of message: the receive DMA has counted all n clocks. */
 void DMA2_Stream2_IRQHandler(void)
 {
+    /* Half transfer: n_bits/2 clocks still to come. Timestamp only. */
+    if (DMA2->LISR & DMA_LISR_HTIF2) {
+        DMA2->LIFCR = DMA_LIFCR_CHTIF2;
+        s_t_half = DWT->CYCCNT;
+    }
+
     if (DMA2->LISR & DMA_LISR_TCIF2) {
+        uint32_t elapsed = DWT->CYCCNT - s_t_half;
+
         DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;
+
+        /* elapsed spans exactly n_bits/2 clock periods (half transfer to
+         * transfer complete). Guard against a wildly out-of-range value from
+         * an aborted cycle before trusting it. */
+        uint32_t halfbits = s_cfg.n_bits / 2u;
+        /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- doing it
+         * the other way truncates to 5 and reports every period 10% short.
+         * Worst case 16 periods at 100 kHz is 288000 cycles, so x1000 still
+         * fits comfortably in 32 bits. */
+        uint32_t per_ns   = (elapsed * 1000u) / (halfbits * (SYSCLK_HZ / 1000000u));
+        if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
+            s_period_ns    = per_ns;
+            s_period_valid = true;
+        }
 
         /* Take the line back and present the Error Flag for the gap. */
         data_drive(s_gap_level);

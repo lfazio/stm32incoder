@@ -161,8 +161,9 @@ static void cmd_stat(void)
                  (unsigned long)incoder_zero_offset(),
                  (unsigned long)ss.frames, (unsigned long)ss.resyncs,
                  (unsigned long)trace_dropped());
-    trace_printf("data_line_idle_high=%u\r\n",
-                 (unsigned)ssi_master_data_idle_high());
+    trace_printf("data_line_idle_high=%u  measured_T=%luns\r\n",
+                 (unsigned)ssi_master_data_idle_high(),
+                 (unsigned long)ss.period_ns);
 }
 
 static void cmd_read(uint32_t count, bool fast)

@@ -196,10 +196,28 @@ threshold, falling-edge trigger on the clock: `burst2m 200 50` with
 Three things this capture actually changed:
 
 - **Tmu was out of spec** at 21.01 µs, because end-of-message is detected on the
-  last *rising* edge and the interrupt adds latency. Now compensated to 19.94 µs
-  — see `GAP_OVERHEAD_US`. The residual half-period term is clock-rate
-  dependent, so Tmu still drifts long as the master slows (0.25 µs at 2 MHz,
-  5 µs at 100 kHz); a master below roughly 600 kHz will see Tmu > 21 µs.
+  last *rising* edge — half a clock period after the falling edge the
+  specification measures from — and the interrupt adds latency on top.
+
+  The half-period term is clock-rate dependent (0.25 µs at 2 MHz, 5 µs at
+  100 kHz), so it is now **measured per frame rather than assumed**: the receive
+  DMA's half-transfer event fires exactly `n_bits/2` clocks before
+  transfer-complete, and both run in non-critical handlers, so `T` comes for
+  free without touching `EXTI3_IRQHandler` and its 26 ns of margin. `stat`
+  reports the measured `T`. Verified at both ends of the range:
+
+  | Master clock | Measured T | Tmu (spec 20 µs ± 1) |
+  |---|---|---|
+  | 2.000 MHz | 498 ns | **19.69 µs** mean, 20.06 max |
+  | 175.8 kHz | 5772 ns | **20.04 µs** mean, 19.96–20.12 |
+
+  With the previous fixed correction the slow case would have sat near 22.6 µs,
+  outside the window.
+- **The Error Flag appears ~0.7 µs after the last rising edge**, not immediately:
+  the end-of-frame interrupt has to run first, so the line still shows D0 for
+  that long. It is 3.5 % of the Tmu window, and SSI4 carries validity in PV
+  inside the frame rather than in the trailing flag, but a controller that
+  samples the Error Flag very early would read the last data bit instead.
 - **The handover margin is thin.** 232 ns worst case against a 250 ns budget is
   about 7 %. It passes, but it is not the comfortable margin estimated before
   measuring.
