@@ -1,2 +1,4 @@
-build/
+# Any build tree: build/, build-hse/, build-noram/, ...
+# Plain "build/" let build-hse and build-noram be committed by `git add -A`.
+build*/
 *.map
