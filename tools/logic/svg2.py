@@ -8,9 +8,11 @@ def load(p):
     return rows
 def cycles_of(rows):
     fall=[rows[k][0] for k in range(1,len(rows)) if rows[k][1]==0 and rows[k-1][1]==1]
+    dl=sorted(fall[i+1]-fall[i] for i in range(len(fall)-1))
+    thr=max(dl[len(dl)//2]*2.5,1e-6)
     cyc=[];cur=[fall[0]]
     for t in fall[1:]:
-        if t-cur[-1]>10e-6: cyc.append(cur);cur=[t]
+        if t-cur[-1]>thr: cyc.append(cur);cur=[t]
         else: cur.append(t)
     cyc.append(cur);return cyc
 W=980;PAD=58

@@ -267,16 +267,18 @@ configuration is the durable reference.)
 | Property | Specified | Measured (200 Read Cycles) |
 |---|---|---|
 | Clocks per message | n = 32 | **32 on every cycle** |
-| Clock rate | 100 kHz … 2 MHz | 1.9997 MHz (period 500.07 ns mean) |
-| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.89 µs mean, 20.06 µs max** |
+| Clock rate | 100 kHz … 2 MHz | 2.0008 MHz (period 499.79 ns mean) |
+| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.95 µs mean, 19.90–20.06** |
 | Idle state | CLOCK and DATA HIGH | HIGH |
-| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×199; **HIGH ×199 under `err on`** |
-| Payload | PD = 370085 (0x5A5A5) | **199/199 decode correctly** |
-| First falling edge → DATA valid | < 0.5·T = 250 ns | **200–224 ns, 209 ns mean** |
+| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×299 under `err on`** |
+| Payload | PD = 370085 (0x5A5A5) | **200/200 decode correctly** |
+| First falling edge → DATA valid | < 0.5·T = 250 ns | **192–224 ns, 209 ns mean** (n=299) |
 
-Both runs show one non-matching first frame. That is the documented one-cycle
-staging latency — the frame was staged before the preceding `err` command took
-effect — not a decode failure; every subsequent cycle is correct.
+The PV=1 run is clean on all 200 cycles, including the first. It was 199/200
+before `ssi_arm()` began resetting the peripheral — that stale opening frame was
+the transmit-buffer bug, not an inherent artefact. The `err on` run still shows
+one non-matching frame, which is the genuine one-cycle staging latency: it was
+staged before the `err` command took effect.
 
 What measuring actually changed:
 
@@ -293,12 +295,12 @@ What measuring actually changed:
 
   | Master clock | Measured T | Tmu (spec 20 µs ± 1) |
   |---|---|---|
-  | 2.000 MHz | 498 ns | **19.69 µs** mean, 20.06 max |
-  | 175.8 kHz | 5772 ns | **20.04 µs** mean, 19.96–20.12 |
+  | 2.000 MHz | 498 ns | **19.95 µs** mean, 19.90–20.06 |
+  | 100.0 kHz | 10000 ns | **20.04 µs** mean, 19.96–20.08 |
 
-  (The 19.69 µs here and the 19.89 µs in the table above are two separate
-  captures of the same build; the spread between runs is well inside the ±1 µs
-  window.)
+  Both ends of the specified range — a 20× span in clock period — land within
+  0.05 µs of the 20 µs target, which is the point of measuring `T` per frame
+  rather than assuming it.
 
   With the previous fixed correction the slow case would have sat near 22.6 µs,
   outside the window.
@@ -351,6 +353,10 @@ margin from 7.2 % to 10.4 %. That fits the ART accelerator's behaviour — flash
 is quick when its instruction cache hits and occasionally slow when it does not,
 while SRAM is uniform.
 
+Re-measured after `ssi_arm()` gained the peripheral reset: 192–224 ns over 299
+cycles, so the worst case is unchanged at 224 ns — the reset costs the handover
+nothing.
+
 Two caveats worth keeping in mind. The 8 ns worst-case gain is exactly one
 sample period at 125 MS/s, so the robust result here is the halved jitter, not
 the 8 ns; both figures reproduced identically across 200- and 1000-cycle runs.
@@ -367,6 +373,10 @@ and `ssi_arm` — was measured and is *worse*:
 |---|---|---|---|
 | EXTI3 only (shipping) | **0.64 µs** mean, 0.71 max | 19.89 µs | 6472 B |
 | Whole path in SRAM | 0.71 µs mean, 0.75 max | 20.03 µs | 7040 B |
+
+(Both rows were measured before `ssi_arm()` gained the peripheral reset, so
+their absolute Tmu reads 19.89 µs rather than today's 19.95 µs. They were taken
+under identical conditions, so the comparison between them still stands.)
 
 That is the same effect seen above, pointing the other way: SRAM trades mean
 speed for determinism. The handover needs the tail bounded because it has a hard
@@ -467,7 +477,7 @@ at a time, and the timer engine restores the pin afterwards.
   The emulator does measure `T` — from the receive DMA's half-transfer to
   transfer-complete interval — and sets the gap to `Tmu − 0.5·T` less a fixed
   interrupt overhead, so Tmu lands inside spec across the whole clock range
-  (verified 19.89 µs at 2 MHz and 20.04 µs at 175.8 kHz). The residual deviation
+  (verified 19.95 µs at 2 MHz and 20.04 µs at 100 kHz). The residual deviation
   is at the *start* of the gap, not its length: the Error Flag appears ~0.7 µs
   late because the end-of-frame interrupt has to run first.
 

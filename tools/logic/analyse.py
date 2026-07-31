@@ -32,9 +32,14 @@ def analyse(path, label, expect_pd, expect_pv):
             i+=1
         return None
     # group falling edges into cycles (gap > 10us starts a new cycle)
+    # Split cycles on a gap relative to the clock period, not a fixed 10 us:
+    # at the 100 kHz end T *is* 10 us, so a fixed threshold shreds every frame.
+    deltas=sorted(fall[i+1]-fall[i] for i in range(len(fall)-1))
+    med=deltas[len(deltas)//2] if deltas else 1e-6
+    thresh=max(med*2.5, 1e-6)
     cycles=[]; cur=[fall[0]]
     for t in fall[1:]:
-        if t-cur[-1] > 10e-6: cycles.append(cur); cur=[t]
+        if t-cur[-1] > thresh: cycles.append(cur); cur=[t]
         else: cur.append(t)
     cycles.append(cur)
 
