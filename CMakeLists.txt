@@ -29,6 +29,13 @@ endif()
 set(SIMENC_CLOCK_SOURCE "AUTO" CACHE STRING "System clock source: AUTO, HSE or HSI")
 set_property(CACHE SIMENC_CLOCK_SOURCE PROPERTY STRINGS AUTO HSE HSI)
 
+# --- Critical path placement --------------------------------------------------
+# ON (default): run the timing-critical SSI handlers from SRAM (.RamFunc) rather
+# than flash. There is no TCM on this Cortex-M4; SRAM execution is the
+# equivalent. Measured effect on the EXTI3 handover at 2 MHz (see README):
+# it halves the jitter, which is what a hard deadline cares about.
+option(SIMENC_RAMFUNC "Run the critical SSI handlers from SRAM" ON)
+
 set(HAL_MODULES
     hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr
     hal_pwr_ex hal_flash hal_flash_ex hal_flash_ramfunc hal_adc hal_adc_ex
@@ -66,6 +73,7 @@ target_compile_definitions(simenc.elf PRIVATE
     STM32F446xx
     USE_HAL_DRIVER
     SIMENC_CLOCK_SOURCE_${SIMENC_CLOCK_SOURCE}=1
+    $<$<BOOL:${SIMENC_RAMFUNC}>:SIMENC_RAMFUNC=1>
 )
 
 target_compile_options(simenc.elf PRIVATE

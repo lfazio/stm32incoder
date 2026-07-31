@@ -1,6 +1,27 @@
 #include "ssi/ssi_slave.h"
 #include "board/board.h"
 
+/* Run the timing-critical handlers from SRAM rather than flash.
+ *
+ * The STM32F446 is a Cortex-M4 and has no TCM -- tightly-coupled memory is a
+ * Cortex-M7 feature. The equivalent here is to place the code in SRAM: the
+ * linker script already gathers .RamFunc inside the .data output section, so
+ * the startup file's existing _sdata.._edata copy relocates it at reset with
+ * no extra plumbing.
+ *
+ * Whether this actually helps is an empirical question, not an obvious win.
+ * The ART accelerator gives zero-wait-state flash execution when its
+ * instruction cache hits (RM0390 3.4.2), and a handler that runs every Read
+ * Cycle is likely resident. Against that, SRAM instruction fetches use the
+ * Cortex-M4 system bus, which also carries data and competes with the DMA
+ * traffic this design leans on. Measure both ways before believing either.
+ */
+#if defined(SIMENC_RAMFUNC)
+#define SSI_RAMFUNC __attribute__((section(".RamFunc"), noinline, long_call))
+#else
+#define SSI_RAMFUNC
+#endif
+
 /* DMA assignment, RM0390 Rev 9 Table 29 (DMA2 request mapping):
  *   SPI1_RX -> DMA2 Stream 2, channel 3   (also available on stream 0)
  *   SPI1_TX -> DMA2 Stream 3, channel 3   (also available on stream 5)
@@ -337,7 +358,7 @@ void ssi_slave_get_stats(ssi_slave_stats_t *out)
  *
  * The interrupt is masked here and re-armed by ssi_arm(), so it costs exactly
  * one interrupt per message rather than one per clock. */
-void EXTI3_IRQHandler(void)
+SSI_RAMFUNC void EXTI3_IRQHandler(void)
 {
     /* Read-modify-write only this pin's two MODER bits. Storing a whole
      * precomputed MODER word would be a couple of cycles faster, but it

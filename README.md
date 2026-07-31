@@ -221,6 +221,37 @@ Three things this capture actually changed:
   spurious +3.16 % for HSI, because the ~90 µs Read Cycle period beats against
   the 100 µs position-update tick that latches TS.
 
+## Critical path in SRAM
+
+There is **no TCM on this part** — tightly-coupled memory is a Cortex-M7 feature
+and the STM32F446 is a Cortex-M4. The equivalent is to execute from SRAM, which
+`SIMENC_RAMFUNC` (default **ON**) does for `EXTI3_IRQHandler`. No linker or
+startup work is needed: the linker script already gathers `.RamFunc` inside the
+`.data` output section, so the startup file's `_sdata.._edata` copy relocates it
+at reset.
+
+Measured on the handover at 2.000 MHz, `err on`, 1000 Read Cycles each:
+
+| `EXTI3_IRQHandler` in | min | mean | max | jitter | worst-case margin |
+|---|---|---|---|---|---|
+| Flash (`0x080019d4`) | 184 ns | 205 ns | 232 ns | 48 ns | 18 ns (7.2 %) |
+| **SRAM (`0x20000014`)** | 200 ns | 209 ns | **224 ns** | **24 ns** | **26 ns (10.4 %)** |
+
+SRAM is *not* uniformly faster — its mean is 4 ns worse and its best case 16 ns
+worse. What it does is halve the jitter and cut the tail, which is what a hard
+deadline actually cares about: worst case improves 232 → 224 ns, lifting the
+margin from 7.2 % to 10.4 %. That fits the ART accelerator's behaviour — flash
+is quick when its instruction cache hits and occasionally slow when it does not,
+while SRAM is uniform.
+
+Two caveats worth keeping in mind. The 8 ns worst-case gain is exactly one
+sample period at 125 MS/s, so the robust result here is the halved jitter, not
+the 8 ns; both figures reproduced identically across 200- and 1000-cycle runs.
+And 26 ns is still not a comfortable margin — this is an incremental
+improvement, not a fix that makes 2 MHz safe by a wide margin.
+
+Build the comparison yourself with `-DSIMENC_RAMFUNC=OFF`.
+
 ## Architecture
 
 Layered so the SSI transport can be reused for the other SSI payload variants:
@@ -307,13 +338,9 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
   in the system for that reason, and it is verified at 2.000 MHz with PV forced
   to 0 (see `read2m`). If D31 is ever seen wrong, this is where to look — drop
   the clock rate to confirm.
-- There is **no TCM on this part** — tightly-coupled memory is a Cortex-M7
-  feature and the STM32F446 is a Cortex-M4. The ART accelerator already gives
-  "0 wait state program execution from flash memory at a CPU frequency up to
-  180 MHz" (RM0390 3.4.2). The Cortex-M4 equivalent is `.ramfunc` in SRAM, and
-  the measured handover (232 ns worst case against 250 ns, ~7 % margin) is thin
-  enough that it is a reasonable lever if a real controller ever samples earlier
-  than this test master does. Measure before and after — the 48 ns spread
-  across 199 cycles suggests bus contention, not flash fetch, dominates.
+- **The handover margin is ~10 % and that is close to inherent.** See
+  "Critical path in SRAM" below for the measurement. Roughly 200 ns of the
+  budget is interrupt entry and EXTI propagation rather than the handler body,
+  which is three register writes, so further code tuning has little headroom.
 - The first `read`/`read2m` after any state change returns the previously staged
   frame — the one-cycle latency described above, not an error. Read twice.

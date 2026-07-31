@@ -168,6 +168,15 @@ reports which locked, flagging `[timestamp OUT OF SPEC]` on the fallback.
 Measure that over a long span: 13 ms gave a spurious +3.16% for HSI because the
 Read Cycle period beats against the 100 us update tick that latches TS.
 
+`SIMENC_RAMFUNC` (default ON) runs `EXTI3_IRQHandler` from SRAM. There is no TCM
+on this Cortex-M4; SRAM execution is the equivalent, and the linker script
+already gathers `.RamFunc` inside `.data` so the startup copy relocates it.
+Measured over 1000 cycles each: flash 184/205/232 ns, SRAM 200/209/224 ns --
+SRAM is not faster on average, it halves the jitter and cuts the tail, lifting
+the worst-case margin from 7.2% to 10.4%. Re-measure with -DSIMENC_RAMFUNC=OFF
+before changing anything here; roughly 200 ns of the budget is interrupt entry
+and EXTI propagation, not the three-register handler body.
+
 Still to do: the same run through two MAX490 modules at RS-422.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper
