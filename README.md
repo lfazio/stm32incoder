@@ -1,0 +1,230 @@
+# simenc — Zettlex IncOder emulator (SSI4) on NUCLEO-F446RE
+
+Emulates a Zettlex/Celera Motion IncOder inductive angle encoder speaking the
+**SSI4** protocol variant, on a NUCLEO-F446RE. The shaft angle comes from one
+analog input; the SSI link is driven by hardware (SPI shift register + DMA +
+timers) so no interrupt runs per bit.
+
+Every register, pin and timing value in this project is taken from a document
+in `docs/`, cited in the source. Nothing is guessed.
+
+| Document | Used for |
+|---|---|
+| `docs/sensors/IncOder_Product_Guide_MIDI_ULTRA_Rev_4.11.8.pdf` | SSI protocol (5.4.1), SSI4 frame (5.4.2), update rate (4.12), zero point (5.2) |
+| `docs/stm32/stm32f446mc.pdf` (DS10693 Rev 11) | pin alternate functions (Table 11), 5 V tolerance (Table 10) |
+| `docs/stm32/rm0390-…​.pdf` (RM0390 Rev 9) | DMA request mapping (Tables 28/29), bus maximum frequencies |
+| `docs/stm32/um1724-…​.pdf` (UM1724 Rev 17) | board connectors (Table 19/29), LD2, VCP, HSE options |
+
+## Build and flash
+
+```sh
+git submodule update --init vendor/STM32CubeF4
+git -C vendor/STM32CubeF4 submodule update --init --depth 1 \
+    Drivers/CMSIS/Device/ST/STM32F4xx Drivers/STM32F4xx_HAL_Driver
+
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --build build --target flash          # OpenOCD, board/st_nucleo_f4.cfg
+```
+
+Console/trace on the ST-LINK virtual COM port, **921600 8N1**:
+
+```sh
+stty -F /dev/ttyACM0 921600 raw -echo && cat /dev/ttyACM0
+```
+
+`-DSIMENC_CLOCK_SOURCE=HSE` switches from the internal 16 MHz RC to the 8 MHz
+ST-LINK MCO (better timestamp accuracy, needs the factory solder bridges of
+UM1724 7.9.1). HSI is the default because it boots regardless of board straps.
+
+## Pin map
+
+All alternate functions verified in DS10693 Table 11; 5 V tolerance ("FT") in
+Table 10; connector positions in UM1724 Tables 19 and 29.
+
+| Signal | Pin | AF | Arduino | Morpho | I/O structure |
+|---|---|---|---|---|---|
+| SSI **CLOCK in** (slave) | PB3 | AF5 SPI1_SCK | CN9-4 (D3) | CN10-31 | FT (5 V tolerant) |
+| SSI **DATA out** (slave) | PB4 | AF5 SPI1_MISO | CN9-6 (D5) | CN10-27 | — |
+| SPI1_MOSI (unused) | PB5 | AF5 | CN9-5 (D4) | CN10-29 | leave open |
+| Master CLOCK out (test) | PB10 | AF5 SPI2_SCK | CN9-7 (D6) | CN10-25 | FT |
+| Master DATA in (test) | PB14 | AF5 SPI2_MISO | — | CN10-28 | FT |
+| Angle analog in | PA0 | ADC1_IN0 | CN8-1 (A0) | CN7-28 | **0–3.3 V only** |
+| Trace/console | PA2/PA3 | AF7 USART2 | — | — | to ST-LINK VCP |
+| Status LED (LD2) | PA5 | GPIO | CN5-6 (D13) | — | — |
+
+SPI1 is deliberately **not** on its default PA5/PA6/PA7: PA5 carries the LD2 LED
+and is `TTa` (3.3 V only), which would both load the clock line and be unsafe
+against a 5 V MAX490 output.
+
+> PB3 is JTDO/TRACESWO. Using it as SPI1_SCK costs SWO trace; SWD debugging
+> (which is what the on-board ST-LINK uses) is unaffected.
+
+## Loopback testing
+
+### Stage 1 — TTL loopback on the board (2 jumper wires)
+
+Both wires land on the ST morpho connector **CN10**, and the DATA wire is
+simply between two facing pins:
+
+| Wire | From | To |
+|---|---|---|
+| CLOCK | **CN10-25** (PB10, master out) | **CN10-31** (PB3, slave in) |
+| DATA | **CN10-27** (PB4, slave out) | **CN10-28** (PB14, master in) |
+
+Equivalently, the clock wire can use the Arduino header: **CN9-7 (D6) → CN9-4 (D3)**.
+
+The DATA pair **CN10-27 / CN10-28 are directly opposite each other** across the
+two rows of CN10, so a plain 2-pin jumper cap works there — no wire needed.
+The CLOCK pair is easiest on the Arduino header, where both ends are
+silkscreened: **D6 → D3**.
+
+Check the wiring before anything else — the firmware can test it itself:
+
+```
+wire
+```
+
+It drives PB10 and PB4 as GPIO and verifies that PB3 and PB14 follow both
+levels, printing `OK` or `OPEN` per wire. `OPEN` means that pin pair is not
+connected, whatever the wire looks like.
+
+Then:
+
+```
+src fixed
+fixed 0x12345      # bypasses the ADC entirely
+read 4             # runs 4 Read Cycles and decodes each frame
+stat
+```
+
+`read` should report `pd=74565` (0x12345) with `pv=1`, `zpd=1`, and a `ts` that
+advances between cycles. With no jumpers fitted you get `raw=FFFFFFFF` instead —
+that is the master's idle pull-up, and `frames=0` in `stat` confirms it.
+
+### Test clock rates
+
+`clk <hz>` selects the fastest SPI prescaler at or below the request, and never
+leaves the 100 kHz…2 MHz SSI window. SPI2 is clocked from PCLK1 = 45 MHz and its
+prescalers are powers of two, so only four rates are reachable:
+
+| Divider | Rate | Note |
+|---|---|---|
+| /16 | 2.8125 MHz | **rejected** — 40 % above the 2 MHz SSI maximum |
+| /32 | 1.40625 MHz | fastest legal rate; the default |
+| /64 | 703.125 kHz | |
+| /128 | 351.5625 kHz | |
+| /256 | 175.78125 kHz | slowest reachable (spec minimum is 100 kHz) |
+
+**Exactly 2 MHz is not reachable from this clock tree**, so `clk 2000000` gives
+1.40625 MHz. Reaching the true 2 MHz corner needs the clock generated by a timer
+(90 MHz / 45 = 2.000 MHz) rather than by the SPI baud generator — PB10 is also
+TIM2_CH3 (AF1). That corner matters because the emulator's tightest deadline is
+the EXTI3 handover: half a clock period, 250 ns at 2 MHz versus 356 ns at
+1.40625 MHz.
+
+### One-cycle data latency is intentional
+
+A value changed between Read Cycles appears in the *next* frame, not the current
+one: the payload is staged at the end of Tmu, matching "after Tmu, the latest
+position data is now available for transmission in the next Read Cycle"
+(5.4.1 note 4). A real encoder latches its data the same way.
+
+### Stage 2 — RS-422 through two MAX490
+
+A MAX490 has one driver and one receiver, which is exactly the SSI topology:
+DATA is driven differentially by the encoder, CLOCK is received differentially.
+Use two modules, U1 on the encoder side and U2 on the controller side.
+
+```
+DATA  (encoder -> controller)
+  PB4  ──▶ U1.DI     U1.Y/Z ══twisted pair══▶ U2.A/B     U2.RO ──▶ PB14
+
+CLOCK (controller -> encoder)
+  PB10 ──▶ U2.DI     U2.Y/Z ══twisted pair══▶ U1.A/B     U1.RO ──▶ PB3
+```
+
+- **Supply:** MAX490 is a 5 V part — feed it from CN6-5 (+5V). Its RO outputs
+  swing to ~5 V, which is safe because PB3 and PB14 are both `FT`. In the other
+  direction the STM32's 3.3 V output clears the MAX490's ~2 V input threshold.
+- **Ground:** tie the two modules' grounds together and to the Nucleo GND.
+- **Termination:** the Product Guide states that DATA outputs and CLOCK inputs
+  are *not* terminated with load resistors. Add 120 Ω at the receiving end only
+  if you run a long pair.
+
+## Architecture
+
+Layered so the SSI transport can be reused for the other SSI payload variants:
+
+```
+encoder/incoder.c        sensor behaviour: position, zero point, timestamp, PV/ZPD
+        ↑
+ssi/ssi4.c               SSI4 frame codec — pure logic, no hardware
+        ↑
+ssi/ssi_slave.c          generic SSI slave transport (SPI1 + DMA + Tmu gap)
+```
+
+`ssi_slave` moves *n* bits and knows nothing of their meaning, so SSI1/2/6/9
+(all byte-aligned) can be added as further codecs beside `ssi4.c`.
+`ssi/ssi_master.c` is a bring-up instrument, not part of the emulator.
+
+### How a Read Cycle is served
+
+1. Between messages PB4 is a plain GPIO holding the SSI idle-HIGH level.
+2. On arming, PB4 is handed to SPI1 (slave, CPOL=1/CPHA=1 — the hardware then
+   changes DATA on the falling edge and the master samples on the rising edge,
+   exactly the SSI relationship). TX DMA feeds the 4 payload bytes.
+3. The **receive** DMA is what counts clocks: its transfer-complete event fires
+   precisely when 32 clocks have been seen, marking end of message.
+4. That ISR takes PB4 back, drives the Error Flag level, and starts TIM6 as a
+   one-shot for Tmu = 20 µs.
+5. TIM6's update returns DATA to HIGH, stages the next frame and re-arms.
+
+Position and timestamp are latched **together** by the 100 µs update tick, so
+`TS` reports when the position was measured rather than when it was sent.
+
+### Peripheral allocation
+
+| Peripheral | Role | DMA (RM0390 Tables 28/29) |
+|---|---|---|
+| SPI1 slave | SSI DATA shift-out, clock counting | TX DMA2 S3 C3, RX DMA2 S2 C3 |
+| TIM6 | Tmu one-shot gap | — |
+| TIM7 | Time Stamp counter, 10 µs tick, wraps 2048 | — |
+| TIM2 | 10 kHz update tick + ADC trigger (TRGO) | — |
+| ADC1 IN0 | angle acquisition | DMA2 S0 C0, circular |
+| USART2 | trace/console | TX DMA1 S6 C4 |
+| SPI2 master | loopback harness | polled |
+
+## Design decisions that are *not* from the specification
+
+- **The analog input is 3.3 V only — there is no 5 V-capable ADC pin.**
+  DS10693 gives the ADC conversion voltage range as `VAIN` = 0…**VREF+**, and
+  VREF+ is tied to VDDA (3.3 V) on this board. The `FT` marking describes the
+  *digital* I/O structure; in analog mode the pad is switched straight onto the
+  ADC sampling capacitor, so 5 V tolerance does not apply — PA0 being `FT` does
+  **not** make it a 5 V analog input. Scale a 5 V source with a divider, keeping
+  the source impedance under the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives
+  5 V → 3.31 V at ~3.4 kΩ, which fits comfortably.
+- **Analog → angle mapping.** 0 V…VDDA maps linearly onto 0…524287 counts
+  (0…360°). The ADC is 12-bit, so an analog-driven position moves in steps of
+  128 counts even though the SSI4 field is 19-bit.
+- **19-bit resolution.** SSI4 caps measurement resolution at 19 bits, so the
+  emulator presents the maximum the variant allows.
+- **Update rate 10 kHz.** The guide specifies "< 0.1 ms"; 100 µs is the fastest
+  value satisfying it.
+- **Error-flag hold time.** The guide holds the Error Flag for `Tmu − 0.5·T`;
+  the emulator holds it for the full `Tmu`, since it does not measure `T`. The
+  difference is at most 5 µs (at the 100 kHz clock limit).
+
+## Known limitations
+
+- `ssi_slave` supports byte-aligned frame lengths only (n = 8/16/24/32), which
+  covers SSI1, SSI2, SSI4, SSI6 and SSI9. SSI7 (n=30) and SSI8 (n=18) would need
+  bit-level padding.
+- Single-turn only; the multi-turn variants (SSI31/32) are not implemented.
+- The EXTI3 handover has a hard deadline: it must set DATA to the SPI output
+  within half a clock period of the first falling edge (250 ns at the 2 MHz
+  maximum, 356 ns at the default 1.4 MHz). It is the highest-priority interrupt
+  in the system for that reason. If the very first bit (D31/PV) is ever seen
+  wrong at 2 MHz, this is where to look — drop the clock rate to confirm.
