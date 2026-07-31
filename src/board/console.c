@@ -134,7 +134,9 @@ static void cmd_help(void)
         "  wire              check the loopback jumpers for continuity\r\n"
         "  read [n]          run n master Read Cycles and decode\r\n"
         "  read2m [n]        same, clocked at exactly 2 MHz (SSI maximum)\r\n"
-        "  err on|off        force PV=0; makes D31 a meaningful test bit\r\n",
+        "  err on|off        force PV=0; makes D31 a meaningful test bit\r\n"
+        "  burst [n] [gapus]    n back-to-back cycles, no tracing between\r\n"
+        "  burst2m [n] [gapus]  same at 2 MHz -- use these for scope capture\r\n",
         (unsigned long)SSI4_POSITION_MAX);
 }
 
@@ -184,6 +186,56 @@ static void cmd_read(uint32_t count, bool fast)
         /* Timg must exceed Tmu (20 us); leave clear margin. */
         ssi_master_delay_us(200);
     }
+}
+
+/* Back-to-back Read Cycles with a fixed gap and no tracing in between, so a
+ * logic analyser sees a clean regular pattern to trigger on. Tracing only
+ * happens after the burst. The gap is well above Tmu (20 us) as Timg requires. */
+static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
+{
+    uint32_t ok = 0;
+    uint32_t bad = 0;
+    uint32_t first = 0;
+    bool     have_first = false;
+
+    if (count == 0u) {
+        count = 1u;
+    }
+    if (gap_us < 25u) {
+        gap_us = 25u;      /* Timg must exceed Tmu = 20 us */
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t raw = 0;
+        bool got = fast ? ssi_master_read_2mhz(SSI4_FRAME_BITS, &raw)
+                        : ssi_master_read(SSI4_FRAME_BITS, &raw);
+        if (!got) {
+            bad++;
+        } else {
+            ssi4_frame_t f;
+            ssi4_unpack(raw, &f);
+            /* The first cycle can carry the previously staged frame, so the
+             * reference is the second one. */
+            if (!have_first && i > 0u) {
+                first = f.pd;
+                have_first = true;
+                ok++;
+            } else if (have_first) {
+                if (f.pd == first) {
+                    ok++;
+                } else {
+                    bad++;
+                }
+            }
+        }
+        ssi_master_delay_us(gap_us);
+    }
+
+    trace_printf("burst: %lu cycles @ %lu Hz, gap %luus -> ok=%lu bad=%lu pd=%lu\r\n",
+                 (unsigned long)count,
+                 (unsigned long)(fast ? ssi_master_exact_hz() : ssi_master_get_clock()),
+                 (unsigned long)gap_us, (unsigned long)ok,
+                 (unsigned long)bad, (unsigned long)first);
 }
 
 static void handle_line(char *line)
@@ -279,6 +331,21 @@ static void handle_line(char *line)
             trace_printf("  dma2 lisr=%08lX hisr=%08lX\r\n",
                          (unsigned long)d[5], (unsigned long)d[6]);
         }
+    } else if (strcmp(cmd, "burst") == 0 || strcmp(cmd, "burst2m") == 0) {
+        uint32_t n    = 50u;
+        bool     fast = (strcmp(cmd, "burst2m") == 0);
+        char    *gap  = next_token(&cursor);
+        uint32_t g    = 100u;
+
+        if (arg != NULL && !parse_u32(arg, &n)) {
+            trace_printf("bad number '%s'\r\n", arg);
+            return;
+        }
+        if (gap != NULL && !parse_u32(gap, &g)) {
+            trace_printf("bad number '%s'\r\n", gap);
+            return;
+        }
+        cmd_burst(n, fast, g);
     } else if (strcmp(cmd, "err") == 0 && arg != NULL) {
         incoder_force_error(strcmp(arg, "on") == 0);
         trace_printf("force error = %u (PV will read %u)\r\n",
