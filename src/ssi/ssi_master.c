@@ -93,6 +93,168 @@ bool ssi_master_data_idle_high(void)
     return (SSI_MASTER_MISO_GPIO->IDR & SSI_MASTER_MISO_PIN) != 0u;
 }
 
+/* --- exact-rate engine: TIM1 compare events + DMA to GPIO ------------------
+ *
+ * TIM1 is on APB2, whose timer clock is 180 MHz, so ARR = 89 gives a 90-count
+ * period = 500 ns = 2.000 MHz exactly. Three DMA streams hang off three
+ * compare channels (RM0390 Rev 9 Table 29, DMA2 channel 6):
+ *
+ *   CH1 -> stream 1 : writes BSRR to pull the clock LOW   (start of period)
+ *   CH3 -> stream 6 : writes BSRR to drive the clock HIGH (mid period)
+ *   CH4 -> stream 4 : reads GPIOB->IDR into the sample buffer
+ *
+ * The pulse count is exactly the DMA transfer count, so the burst stops itself
+ * after n edges and leaves the line HIGH -- no software has to chase the timer.
+ * Streams 0/2/3 of DMA2 are already taken by ADC1 and SPI1, hence 1/4/6.
+ */
+#define X_TIM            TIM1
+#define X_ARR            89u    /* 180 MHz / 90 = 2.000 MHz */
+#define X_CCR_FALL       1u
+#define X_CCR_RISE       46u    /* half a period after the falling edge */
+#define X_CCR_SAMPLE     47u    /* just after the rising edge */
+#define X_DMA_CHANNEL    6u
+
+#define X_LOW_STREAM     DMA2_Stream1
+#define X_HIGH_STREAM    DMA2_Stream6
+#define X_SAMPLE_STREAM  DMA2_Stream4
+
+#define X_LOW_CLEAR   (DMA_LIFCR_CTCIF1 | DMA_LIFCR_CHTIF1 | DMA_LIFCR_CTEIF1 | \
+                       DMA_LIFCR_CDMEIF1 | DMA_LIFCR_CFEIF1)
+#define X_HIGH_CLEAR  (DMA_HIFCR_CTCIF6 | DMA_HIFCR_CHTIF6 | DMA_HIFCR_CTEIF6 | \
+                       DMA_HIFCR_CDMEIF6 | DMA_HIFCR_CFEIF6)
+#define X_SMPL_CLEAR  (DMA_HIFCR_CTCIF4 | DMA_HIFCR_CHTIF4 | DMA_HIFCR_CTEIF4 | \
+                       DMA_HIFCR_CDMEIF4 | DMA_HIFCR_CFEIF4)
+
+static const uint32_t s_clk_low  = (uint32_t)SSI_MASTER_SCK_PIN << 16u;
+static const uint32_t s_clk_high = (uint32_t)SSI_MASTER_SCK_PIN;
+static volatile uint32_t s_idr[32];
+
+static uint32_t s_dbg_ndtr_lo, s_dbg_ndtr_hi, s_dbg_ndtr_smp;
+static uint32_t s_dbg_tim_cnt, s_dbg_tim_sr, s_dbg_lisr, s_dbg_hisr;
+
+void ssi_master_2mhz_debug(uint32_t *out7)
+{
+    out7[0] = s_dbg_ndtr_lo;
+    out7[1] = s_dbg_ndtr_hi;
+    out7[2] = s_dbg_ndtr_smp;
+    out7[3] = s_dbg_tim_cnt;
+    out7[4] = s_dbg_tim_sr;
+    out7[5] = s_dbg_lisr;
+    out7[6] = s_dbg_hisr;
+}
+
+uint32_t ssi_master_exact_hz(void)
+{
+    return APB2_TIMCLK_HZ / (X_ARR + 1u);
+}
+
+static void x_stream_setup(DMA_Stream_TypeDef *st, uint32_t par, uint32_t m0ar,
+                           uint32_t cr_extra, uint16_t ndtr)
+{
+    st->CR &= ~DMA_SxCR_EN;
+    while (st->CR & DMA_SxCR_EN) { }
+
+    st->PAR  = par;
+    st->M0AR = m0ar;
+    st->NDTR = ndtr;
+    st->FCR  = 0;
+    st->CR   = (X_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
+             | DMA_SxCR_PSIZE_1 | DMA_SxCR_MSIZE_1   /* 32-bit both sides */
+             | DMA_SxCR_PL_0 | DMA_SxCR_PL_1         /* very high */
+             | cr_extra;
+}
+
+bool ssi_master_read_2mhz(uint8_t n_bits, uint32_t *raw)
+{
+    if (n_bits == 0u || n_bits > 32u) {
+        return false;
+    }
+    if (!ssi_master_data_idle_high()) {
+        return false;
+    }
+
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    /* Take the clock pin away from SPI2 and hold it at the idle HIGH level
+     * before anything else, so the slave sees no spurious edge. */
+    GPIOB->BSRR = SSI_MASTER_SCK_PIN;
+    uint32_t moder_save = GPIOB->MODER;
+    GPIOB->MODER = (moder_save & ~(3u << (10u * 2u))) | (1u << (10u * 2u));
+
+    X_TIM->CR1  = 0;
+    X_TIM->PSC  = 0;
+    X_TIM->ARR  = X_ARR;
+    X_TIM->CCR1 = X_CCR_FALL;
+    X_TIM->CCR3 = X_CCR_RISE;
+    X_TIM->CCR4 = X_CCR_SAMPLE;
+    X_TIM->CCMR1 = 0;          /* channels as output compare, frozen: the
+                                * compare flags still fire, and no pin is
+                                * driven by the timer itself */
+    X_TIM->CCMR2 = 0;
+    X_TIM->CNT  = 0;
+    X_TIM->SR   = 0;
+
+    DMA2->LIFCR = X_LOW_CLEAR;
+    DMA2->HIFCR = X_HIGH_CLEAR | X_SMPL_CLEAR;
+
+    x_stream_setup(X_LOW_STREAM,  (uint32_t)(uintptr_t)&GPIOB->BSRR,
+                   (uint32_t)(uintptr_t)&s_clk_low,  DMA_SxCR_DIR_0, n_bits);
+    x_stream_setup(X_HIGH_STREAM, (uint32_t)(uintptr_t)&GPIOB->BSRR,
+                   (uint32_t)(uintptr_t)&s_clk_high, DMA_SxCR_DIR_0, n_bits);
+    x_stream_setup(X_SAMPLE_STREAM, (uint32_t)(uintptr_t)&GPIOB->IDR,
+                   (uint32_t)(uintptr_t)s_idr, DMA_SxCR_MINC, n_bits);
+
+    X_LOW_STREAM->CR    |= DMA_SxCR_EN;
+    X_HIGH_STREAM->CR   |= DMA_SxCR_EN;
+    X_SAMPLE_STREAM->CR |= DMA_SxCR_EN;
+
+    X_TIM->DIER = TIM_DIER_CC1DE | TIM_DIER_CC3DE | TIM_DIER_CC4DE;
+    X_TIM->CR1  = TIM_CR1_CEN;
+
+    /* n_bits x 500 ns is 16 us for a 32-bit frame; bail out far beyond that. */
+    uint32_t guard = 0;
+    while ((DMA2->HISR & DMA_HISR_TCIF4) == 0u) {
+        if (++guard > 200000u) {
+            break;
+        }
+    }
+
+    s_dbg_ndtr_lo  = X_LOW_STREAM->NDTR;
+    s_dbg_ndtr_hi  = X_HIGH_STREAM->NDTR;
+    s_dbg_ndtr_smp = X_SAMPLE_STREAM->NDTR;
+    s_dbg_tim_cnt  = X_TIM->CNT;
+    s_dbg_tim_sr   = X_TIM->SR;
+    s_dbg_lisr     = DMA2->LISR;
+    s_dbg_hisr     = DMA2->HISR;
+
+    X_TIM->CR1  = 0;
+    X_TIM->DIER = 0;
+    X_LOW_STREAM->CR    &= ~DMA_SxCR_EN;
+    X_HIGH_STREAM->CR   &= ~DMA_SxCR_EN;
+    X_SAMPLE_STREAM->CR &= ~DMA_SxCR_EN;
+
+    bool complete = (guard <= 200000u);
+
+    /* Leave the line HIGH and give the pin back to SPI2. */
+    GPIOB->BSRR  = SSI_MASTER_SCK_PIN;
+    GPIOB->MODER = moder_save;
+
+    if (!complete) {
+        return false;
+    }
+
+    uint32_t v = 0;
+    for (uint8_t i = 0; i < n_bits; i++) {
+        v <<= 1;
+        if (s_idr[i] & SSI_MASTER_MISO_PIN) {
+            v |= 1u;
+        }
+    }
+    *raw = v;
+    return true;
+}
+
 bool ssi_loopback_check(bool *clock_ok, bool *data_ok)
 {
     const uint32_t drive = SSI_MASTER_SCK_PIN | SSI_SLAVE_DATA_PIN;

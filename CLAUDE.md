@@ -109,6 +109,13 @@ Both were found by reading registers off the running target, not by reasoning:
   (measured: `IDR` bit 4 = 0 when armed). SSI requires DATA to idle HIGH, so the
   pin stays GPIO-high until EXTI3 hands it over on the first falling edge.
 
+- **Never write a shared register wholesale from an ISR.** `EXTI3_IRQHandler`
+  stored a precomputed `GPIOB->MODER` word for speed, which republished *every*
+  pin's mode as it was when the frame was armed. That silently reverted the test
+  harness's clock pin from GPIO back to alternate function on the first edge,
+  killing the clock mid-burst. Read-modify-write only the bits you own; the few
+  extra cycles still fit the 250 ns budget.
+
 A third trap, cheap to re-check: enabling an IRQ in the NVIC without defining
 its handler silently binds the startup file's `Default_Handler`, which is an
 infinite loop. The board then hangs with no output the moment that interrupt
@@ -140,8 +147,13 @@ GPIO/SPI/DMA register configuration of both SSI ends.
 and `zpd=1`, at 1.40625 MHz, 351.6 kHz and 175.8 kHz, with `resyncs=0`. The
 timestamp advanced exactly 20 ticks (200 µs) between reads spaced 200 µs apart.
 
-Still to do: the same run through two MAX490 modules at RS-422, and the 2 MHz
-corner (not reachable from this clock tree — see README "Test clock rates").
+**The 2 MHz corner is verified**: `read2m` clocks at exactly 2.000 MHz from TIM1
+compare events driving DMA writes to `GPIOB->BSRR`. With `err on` forcing PV=0 —
+which is what makes D31 a sensitive bit, since PV is normally 1 and the line also
+idles HIGH — 25 of 25 frames decoded correctly with `resyncs=0`. That proves the
+EXTI3 handover meets its 250 ns deadline.
+
+Still to do: the same run through two MAX490 modules at RS-422.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper
 is missing. Note the first `read` immediately after `wire` can return a bad frame

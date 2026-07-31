@@ -325,7 +325,14 @@ void ssi_slave_get_stats(ssi_slave_stats_t *out)
  * one interrupt per message rather than one per clock. */
 void EXTI3_IRQHandler(void)
 {
-    SSI_SLAVE_GPIO->MODER = s_moder_af;
+    /* Read-modify-write only this pin's two MODER bits. Storing a whole
+     * precomputed MODER word would be a couple of cycles faster, but it
+     * republishes the mode of every other pin in the port as it was when the
+     * frame was armed -- which silently reverted the test harness's clock pin
+     * from GPIO back to alternate function on the first edge, killing the
+     * clock mid-burst. Never write a shared register wholesale from an ISR. */
+    SSI_SLAVE_GPIO->MODER =
+        (SSI_SLAVE_GPIO->MODER & ~DATA_MODER_MASK) | DATA_MODER_AF;
     EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
     EXTI->PR   = SSI_SLAVE_SCK_PIN;
 }

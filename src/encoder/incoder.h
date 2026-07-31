@@ -46,6 +46,14 @@ uint32_t incoder_zero_offset(void);
 /* Raw free-running Time Stamp counter, 0..2047. */
 uint16_t incoder_timestamp_now(void);
 
+/* Forces PV to 0, i.e. reports the error condition. Besides exercising the
+ * Error Flag path, this is what makes D31 a meaningful test bit: PV is
+ * normally 1, and the DATA line also idles HIGH, so a late first-bit handover
+ * would be invisible. With PV forced to 0, a late handover shows up as D31
+ * reading 1 instead of 0. */
+void incoder_force_error(bool on);
+bool incoder_error_forced(void);
+
 /* Frame provider handed to the SSI transport. */
 void incoder_ssi_provider(void *ctx, ssi_slave_frame_t *out);
 

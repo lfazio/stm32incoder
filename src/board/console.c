@@ -132,7 +132,9 @@ static void cmd_help(void)
         "  zero set|reset    zero point set / restore factory (ZPD)\r\n"
         "  clk <hz>          SSI master test clock (100k..2M)\r\n"
         "  wire              check the loopback jumpers for continuity\r\n"
-        "  read [n]          run n master Read Cycles and decode\r\n",
+        "  read [n]          run n master Read Cycles and decode\r\n"
+        "  read2m [n]        same, clocked at exactly 2 MHz (SSI maximum)\r\n"
+        "  err on|off        force PV=0; makes D31 a meaningful test bit\r\n",
         (unsigned long)SSI4_POSITION_MAX);
 }
 
@@ -158,7 +160,7 @@ static void cmd_stat(void)
                  (unsigned)ssi_master_data_idle_high());
 }
 
-static void cmd_read(uint32_t count)
+static void cmd_read(uint32_t count, bool fast)
 {
     if (count == 0u) {
         count = 1u;
@@ -166,8 +168,10 @@ static void cmd_read(uint32_t count)
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t raw = 0;
+        bool ok = fast ? ssi_master_read_2mhz(SSI4_FRAME_BITS, &raw)
+                       : ssi_master_read(SSI4_FRAME_BITS, &raw);
 
-        if (!ssi_master_read(SSI4_FRAME_BITS, &raw)) {
+        if (!ok) {
             trace_printf("read %lu: DATA not idle high, aborted\r\n", (unsigned long)i);
         } else {
             ssi4_frame_t f;
@@ -253,13 +257,33 @@ static void handle_line(char *line)
                      dt ? "OK" : "OPEN");
         trace_printf("loopback %s\r\n", ok ? "ready" : "NOT wired");
         ssi_slave_start();      /* the test borrowed the DATA pin */
-    } else if (strcmp(cmd, "read") == 0) {
-        uint32_t n = 1u;
+    } else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "read2m") == 0) {
+        uint32_t n    = 1u;
+        bool     fast = (strcmp(cmd, "read2m") == 0);
         if (arg != NULL && !parse_u32(arg, &n)) {
             trace_printf("bad number '%s'\r\n", arg);
             return;
         }
-        cmd_read(n);
+        if (fast) {
+            trace_printf("clocking at %lu Hz (SSI maximum)\r\n",
+                         (unsigned long)ssi_master_exact_hz());
+        }
+        cmd_read(n, fast);
+        if (fast) {
+            uint32_t d[7];
+            ssi_master_2mhz_debug(d);
+            trace_printf("  ndtr lo=%lu hi=%lu smp=%lu  tim cnt=%lu sr=%08lX\r\n",
+                         (unsigned long)d[0], (unsigned long)d[1],
+                         (unsigned long)d[2], (unsigned long)d[3],
+                         (unsigned long)d[4]);
+            trace_printf("  dma2 lisr=%08lX hisr=%08lX\r\n",
+                         (unsigned long)d[5], (unsigned long)d[6]);
+        }
+    } else if (strcmp(cmd, "err") == 0 && arg != NULL) {
+        incoder_force_error(strcmp(arg, "on") == 0);
+        trace_printf("force error = %u (PV will read %u)\r\n",
+                     (unsigned)incoder_error_forced(),
+                     (unsigned)!incoder_error_forced());
     } else {
         trace_printf("unknown command '%s', try 'help'\r\n", cmd);
     }

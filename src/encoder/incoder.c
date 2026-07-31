@@ -21,6 +21,7 @@ static volatile bool     s_valid;
 static volatile uint32_t s_updates;
 static uint32_t          s_zero_offset;
 static bool              s_zero_default = true;
+static volatile bool     s_force_error;
 
 static void timestamp_timer_init(void)
 {
@@ -62,7 +63,7 @@ void incoder_update(void)
      * was measured, not when it is transmitted. */
     s_timestamp = incoder_timestamp_now();
     s_position  = pos;
-    s_valid     = position_source_valid();
+    s_valid     = position_source_valid() && !s_force_error;
     s_updates++;
 }
 
@@ -91,6 +92,16 @@ void incoder_zero_reset(void)
 uint32_t incoder_zero_offset(void)
 {
     return s_zero_offset;
+}
+
+void incoder_force_error(bool on)
+{
+    s_force_error = on;
+}
+
+bool incoder_error_forced(void)
+{
+    return s_force_error;
 }
 
 void incoder_ssi_provider(void *ctx, ssi_slave_frame_t *out)
