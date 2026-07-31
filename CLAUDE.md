@@ -153,6 +153,16 @@ which is what makes D31 a sensitive bit, since PV is normally 1 and the line als
 idles HIGH — 25 of 25 frames decoded correctly with `resyncs=0`. That proves the
 EXTI3 handover meets its 250 ns deadline.
 
+**Verified with a logic analyser** (Saleae Logic Pro 16 via the `logic2` MCP,
+125 MS/s): 32 clocks per cycle on all 200, Tmu 19.94 us mean, gap level tracking
+the Error Flag both ways, 200/200 payloads correct, and the EXTI3 handover
+measured at 184-232 ns against its 250 ns budget. See README "Measured against
+the specification" for the numbers and the three things the capture changed.
+
+Note the capture also showed the clock running 1.37% fast, which is the HSI RC.
+The Time Stamp is specified to "better than 1%", so an HSI build does not meet
+it -- use -DSIMENC_CLOCK_SOURCE=HSE when timestamp accuracy matters.
+
 Still to do: the same run through two MAX490 modules at RS-422.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper

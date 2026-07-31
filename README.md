@@ -171,6 +171,40 @@ CLOCK (controller -> encoder)
   are *not* terminated with load resistors. Add 120 Ω at the receiving end only
   if you run a long pair.
 
+## Measured against the specification
+
+Captured with a Saleae Logic Pro 16 at 125 MS/s (8 ns resolution), 3.3 V
+threshold, falling-edge trigger on the clock: `burst2m 200 50` with
+`fixed 0x5A5A5`, run once with PV=1 and once with `err on`.
+
+![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
+
+| Property | Specified | Measured (200 Read Cycles) |
+|---|---|---|
+| Clocks per message | n = 32 | **32 on every cycle** |
+| Clock rate | 100 kHz … 2 MHz | 2.027 MHz (period 493 ns mean, 440–544 ns) |
+| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.94 µs mean, 20.09 µs max** |
+| Idle state | CLOCK and DATA HIGH | HIGH |
+| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×199 under `err on`** |
+| Payload | PD = 370085 (0x5A5A5) | **200/200 decode correctly** |
+| First falling edge → DATA valid | < 0.5·T = 250 ns | **184–232 ns, 201 ns mean** |
+
+Three things this capture actually changed:
+
+- **Tmu was out of spec** at 21.01 µs, because end-of-message is detected on the
+  last *rising* edge and the interrupt adds latency. Now compensated to 19.94 µs
+  — see `GAP_OVERHEAD_US`. The residual half-period term is clock-rate
+  dependent, so Tmu still drifts long as the master slows (0.25 µs at 2 MHz,
+  5 µs at 100 kHz); a master below roughly 600 kHz will see Tmu > 21 µs.
+- **The handover margin is thin.** 232 ns worst case against a 250 ns budget is
+  about 7 %. It passes, but it is not the comfortable margin estimated before
+  measuring.
+- **The clock is 1.37 % fast** (493 ns rather than 500 ns), which is the HSI RC
+  oscillator, not the timer. The Time Stamp field is specified accurate to
+  "better than 1 % (based on the system oscillator)", so **an HSI build does not
+  meet the timestamp accuracy**. Build with `-DSIMENC_CLOCK_SOURCE=HSE` for
+  spec-compliant timestamps.
+
 ## Architecture
 
 Layered so the SSI transport can be reused for the other SSI payload variants:
@@ -216,14 +250,24 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
 
 ## Design decisions that are *not* from the specification
 
-- **The analog input is 3.3 V only — there is no 5 V-capable ADC pin.**
-  DS10693 gives the ADC conversion voltage range as `VAIN` = 0…**VREF+**, and
-  VREF+ is tied to VDDA (3.3 V) on this board. The `FT` marking describes the
-  *digital* I/O structure; in analog mode the pad is switched straight onto the
-  ADC sampling capacitor, so 5 V tolerance does not apply — PA0 being `FT` does
-  **not** make it a 5 V analog input. Scale a 5 V source with a divider, keeping
-  the source impedance under the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives
-  5 V → 3.31 V at ~3.4 kΩ, which fits comfortably.
+- **The analog input is 3.3 V only — there is no 5 V-capable ADC pin, and no
+  way to make one.** DS10693 gives the ADC conversion range as `VAIN` =
+  0…**VREF+**. The `FT` marking describes the *digital* I/O structure; in analog
+  mode the pad switches straight onto the ADC sampling capacitor, so PA0 being
+  `FT` does **not** make it a 5 V analog input.
+
+  Neither supply trick helps. On the LQFP64 the datasheet pinout labels pin 13
+  **`VDDA/VREF+`** and pin 12 **`VSSA/VREF-`** — VREF+ is internally bonded to
+  VDDA, so raising VREF+ *is* raising VDDA. And DS10693 Table 13 gives the
+  absolute maximum for "External main supply voltage (including VDDA, VDD,
+  VDDUSB and VBAT)" as **4.0 V**, with an operating range of 1.7–3.6 V. Feeding
+  5 V to VDDA/VREF+ — with or without SB57 removed — exceeds the absolute
+  maximum and would damage the part, and VDDA also feeds the RCs and PLL, not
+  just the ADC. Removing SB57 is only useful for supplying a *cleaner* reference
+  from CN5 pin 8 within 1.7–3.6 V (keeping VDDA − VREF+ < 1.2 V).
+
+  Scale a 5 V source with a divider instead, keeping the source impedance under
+  the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives 5 V → 3.31 V at ~3.4 kΩ.
 - **Analog → angle mapping.** 0 V…VDDA maps linearly onto 0…524287 counts
   (0…360°). The ADC is 12-bit, so an analog-driven position moves in steps of
   128 counts even though the SSI4 field is 19-bit.
@@ -250,8 +294,10 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
 - There is **no TCM on this part** — tightly-coupled memory is a Cortex-M7
   feature and the STM32F446 is a Cortex-M4. The ART accelerator already gives
   "0 wait state program execution from flash memory at a CPU frequency up to
-  180 MHz" (RM0390 3.4.2), so the handover already runs at full speed. If more
-  worst-case determinism were ever wanted the option is `.ramfunc` in SRAM, but
-  the 2 MHz result gives no reason to.
+  180 MHz" (RM0390 3.4.2). The Cortex-M4 equivalent is `.ramfunc` in SRAM, and
+  the measured handover (232 ns worst case against 250 ns, ~7 % margin) is thin
+  enough that it is a reasonable lever if a real controller ever samples earlier
+  than this test master does. Measure before and after — the 48 ns spread
+  across 199 cycles suggests bus contention, not flash fetch, dominates.
 - The first `read`/`read2m` after any state change returns the previously staged
   frame — the one-cycle latency described above, not an error. Read twice.

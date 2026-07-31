@@ -19,10 +19,24 @@
                             DMA_LIFCR_CDMEIF3 | DMA_LIFCR_CFEIF3)
 
 /* Tmu gap timer. TIM6 is a basic timer on APB1; with the APB1 prescaler != 1
- * its clock is 2 x PCLK1 = 90 MHz, so a prescaler of 90 gives a 1 us tick. */
+ * its clock is 2 x PCLK1 = 90 MHz, so a prescaler of 90 gives a 1 us tick.
+ *
+ * The gap does not start exactly at the reference the specification uses. Tmu
+ * is measured "from last falling edge of clock", but end-of-message is detected
+ * by the receive DMA, which completes on the last *rising* edge -- half a clock
+ * period later -- and the interrupt then takes time to reach gap_timer_start().
+ *
+ * A logic-analyser capture at 2 MHz measured 21.01 us mean from the last
+ * falling edge, against the specified 20 us +/- 1 us. Subtracting one tick
+ * centres it. The residual term is the half clock period, which the emulator
+ * cannot know: it is 0.25 us at 2 MHz but 5 us at the 100 kHz lower limit, so
+ * Tmu drifts long as the master's clock slows. See README "Measured against
+ * the specification".
+ */
 #define GAP_TIM         TIM6
 #define GAP_TIM_IRQn    TIM6_DAC_IRQn
 #define GAP_TICK_PER_US 1u
+#define GAP_OVERHEAD_US 1u
 
 static ssi_slave_config_t    s_cfg;
 static ssi_slave_provider_t  s_provider;
@@ -237,7 +251,7 @@ static void gap_timer_init(void)
 
     GAP_TIM->CR1 = 0;
     GAP_TIM->PSC = (APB1_TIMCLK_HZ / 1000000u) - 1u;   /* 1 us per tick */
-    GAP_TIM->ARR = (s_cfg.tmu_us * GAP_TICK_PER_US) - 1u;
+    GAP_TIM->ARR = ((s_cfg.tmu_us - GAP_OVERHEAD_US) * GAP_TICK_PER_US) - 1u;
     GAP_TIM->EGR = TIM_EGR_UG;      /* load PSC/ARR */
     GAP_TIM->SR  = 0;               /* UG set UIF; drop it */
     GAP_TIM->CR1 = TIM_CR1_OPM;     /* one pulse: stops itself at update */
