@@ -228,6 +228,19 @@ one: the payload is staged at the end of Tmu, matching "after Tmu, the latest
 position data is now available for transmission in the next Read Cycle"
 (5.4.1 note 4). A real encoder latches its data the same way.
 
+Measured, changing `fixed` and reading immediately each time:
+
+| after | Read Cycle 0 | Read Cycles 1+ |
+|---|---|---|
+| `fixed 0x12345` | 370085 *(previous)* | **74565** |
+| `fixed 0x5A5A5` | 74565 *(previous)* | **370085** |
+| `fixed 0x2AAAA` | 370085 *(previous)* | **174762** |
+
+Exactly one cycle, and every stale frame is well formed — `pv=1`, `zpd=1`,
+correct structure. `burst` skips two warm-up cycles rather than one: only one is
+needed for the staging itself, the second is margin against a console command
+landing mid-cycle.
+
 ### Stage 2 — RS-422 through two MAX490
 
 A MAX490 has one driver and one receiver, which is exactly the SSI topology:
@@ -497,6 +510,12 @@ at a time, and the timer engine restores the pin afterwards.
   "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
-- The first Read Cycle after any state change returns the previously staged
-  frame — the one-cycle latency described above, not an error. `burst` skips two
-  warm-up cycles for this reason; with `read`, just read twice.
+- The first Read Cycle after a state change carries the **previous** value —
+  exactly one cycle, measured. It is not an error and not corruption: the frame
+  is well formed, `pv` and `zpd` correct, simply staged before the change landed.
+  See "One-cycle data latency is intentional"; `read` twice, or use `burst`,
+  which skips warm-up cycles.
+
+  Do not confuse this with the *malformed* opening frame this project used to
+  show. That one was the stranded transmit byte and is fixed — the PV=1 capture
+  is now 200/200 including the first cycle.
