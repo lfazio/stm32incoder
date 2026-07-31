@@ -12,8 +12,8 @@ in `docs/`, cited in the source. Nothing is guessed.
 |---|---|
 | `docs/sensors/IncOder_Product_Guide_MIDI_ULTRA_Rev_4.11.8.pdf` | SSI protocol (5.4.1), SSI4 frame (5.4.2), update rate (4.12), zero point (5.2) |
 | `docs/stm32/stm32f446mc.pdf` (DS10693 Rev 11) | pin alternate functions (Table 11), 5 V tolerance (Table 10) |
-| `docs/stm32/rm0390-…​.pdf` (RM0390 Rev 9) | DMA request mapping (Tables 28/29), bus maximum frequencies |
-| `docs/stm32/um1724-…​.pdf` (UM1724 Rev 17) | board connectors (Table 19/29), LD2, VCP, HSE options |
+| `docs/stm32/rm0390-….pdf` (RM0390 Rev 9) | DMA request mapping (Tables 28/29), bus maximum frequencies |
+| `docs/stm32/um1724-….pdf` (UM1724 Rev 17) | board connectors (Table 19/29), LD2, VCP, HSE options |
 
 ## Build and flash
 
@@ -52,11 +52,15 @@ Table 10; connector positions in UM1724 Tables 19 and 29.
 | SSI **CLOCK in** (slave) | PB3 | AF5 SPI1_SCK | CN9-4 (D3) | CN10-31 | FT (5 V tolerant) |
 | SSI **DATA out** (slave) | PB4 | AF5 SPI1_MISO | CN9-6 (D5) | CN10-27 | — |
 | SPI1_MOSI (unused) | PB5 | AF5 | CN9-5 (D4) | CN10-29 | leave open |
-| Master CLOCK out (test) | PB10 | AF5 SPI2_SCK | CN9-7 (D6) | CN10-25 | FT |
-| Master DATA in (test) | PB14 | AF5 SPI2_MISO | — | CN10-28 | FT |
+| Master CLOCK out (test) | PB10 | GPIO, or AF5 SPI2_SCK | CN9-7 (D6) | CN10-25 | FT |
+| Master DATA in (test) | PB14 | read via IDR, or AF5 SPI2_MISO | — | CN10-28 | FT |
 | Angle analog in | PA0 | ADC1_IN0 | CN8-1 (A0) | CN7-28 | **0–3.3 V only** |
 | Trace/console | PA2/PA3 | AF7 USART2 | — | — | to ST-LINK VCP |
 | Status LED (LD2) | PA5 | GPIO | CN5-6 (D13) | — | — |
+
+The test-master pins carry two alternatives: by default TIM1+DMA drives PB10 as
+plain GPIO and samples PB14 through `GPIOB->IDR`, while `readspi`/`burstspi` put
+both into AF5 for SPI2. Nothing about the wiring changes between the two.
 
 SPI1 is deliberately **not** on its default PA5/PA6/PA7: PA5 carries the LD2 LED
 and is `TTa` (3.3 V only), which would both load the clock line and be unsafe
@@ -84,6 +88,10 @@ terminated; `printf 'stat\r' > /dev/ttyACM0` works while a reader holds the port
 | `read [n]` | run *n* Read Cycles and decode each |
 | `burst [n] [gapus]` | *n* cycles back to back, summary only — use for scope capture |
 | `readspi [n]`, `burstspi [n] [gapus]` | same via the SPI baud generator, as a cross-check |
+
+`read` also prints a diagnostic line after the burst — the three DMA `NDTR`
+counters plus TIM1 and DMA2 status — which is what pinned down a clock that was
+dying mid-burst. Ignore it unless something is wrong.
 
 `stat` reports the position source, position, timestamp, PV/ZPD, the internal
 update count, the raw ADC value, the zero offset, completed frames, resyncs,
@@ -167,8 +175,9 @@ Verified against the slave's own independent period measurement:
 | 250 kHz | 250 000 Hz | 3999 ns |
 | 100 kHz | 100 000 Hz | 10000 ns |
 
-Every rate programmed exactly (+0.0 %), and `burst 40` decoded `ok=39 bad=0` at
-each. The power-on default is **500 kHz**.
+Every rate programmed exactly (+0.0 %), and `burst 40` decoded `ok=38 bad=0` at
+each — `burst` skips two warm-up cycles, so it reports `n-2`. The power-on
+default is **500 kHz**.
 
 `readspi` / `burstspi` run the same traffic through the SPI baud generator
 instead. That path only reaches 1.40625 MHz, 703.125 kHz, 351.5625 kHz and
@@ -227,9 +236,12 @@ CLOCK (controller -> encoder)
 Captured with a Saleae Logic Pro 16 at 125 MS/s (8 ns resolution), 3.3 V
 threshold, falling-edge trigger on the clock: `clk 2000000` then `burst 200 50` with `fixed 0x5A5A5`, run once with PV=1 and once with `err on`.
 
-**These numbers are measured against commit `be94f25`** (HSE clock, critical path
-in SRAM, dynamic Tmu correction). Re-capture after touching the SSI path — an
-earlier revision of this table was silently stale for exactly that reason.
+**These numbers were measured with HSE locked, the critical path in SRAM
+(`SIMENC_RAMFUNC=ON`) and the dynamic Tmu correction in place.** Re-capture with
+`tools/logic/` after touching the SSI path — an earlier revision of this table
+was silently stale for exactly that reason. (This used to cite a commit hash;
+history has since been rewritten twice, which made the hash dangle. The build
+configuration is the durable reference.)
 
 ![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
 
@@ -264,6 +276,10 @@ What measuring actually changed:
   |---|---|---|
   | 2.000 MHz | 498 ns | **19.69 µs** mean, 20.06 max |
   | 175.8 kHz | 5772 ns | **20.04 µs** mean, 19.96–20.12 |
+
+  (The 19.69 µs here and the 19.89 µs in the table above are two separate
+  captures of the same build; the spread between runs is well inside the ±1 µs
+  window.)
 
   With the previous fixed correction the slow case would have sat near 22.6 µs,
   outside the window.
@@ -306,8 +322,8 @@ Measured on the handover at 2.000 MHz, `err on`, 1000 Read Cycles each:
 
 | `EXTI3_IRQHandler` in | min | mean | max | jitter | worst-case margin |
 |---|---|---|---|---|---|
-| Flash (`0x080019d4`) | 184 ns | 205 ns | 232 ns | 48 ns | 18 ns (7.2 %) |
-| **SRAM (`0x20000014`)** | 200 ns | 209 ns | **224 ns** | **24 ns** | **26 ns (10.4 %)** |
+| Flash (`-DSIMENC_RAMFUNC=OFF`) | 184 ns | 205 ns | 232 ns | 48 ns | 18 ns (7.2 %) |
+| **SRAM (default)** | 200 ns | 209 ns | **224 ns** | **24 ns** | **26 ns (10.4 %)** |
 
 SRAM is *not* uniformly faster — its mean is 4 ns worse and its best case 16 ns
 worse. What it does is halve the jitter and cut the tail, which is what a hard
@@ -340,8 +356,8 @@ its latency is compensated, and its jitter is ~±0.1 µs against a ±1 µs Tmu
 window — so the mean is what matters and flash is quicker. It would also cost
 568 bytes of RAM and force `GAP_ISR_OVERHEAD_NS` to be re-tuned.
 
-The test master needs nothing: its 2 MHz clock comes from TIM1 compare events
-driving DMA, with software out of the loop entirely.
+The test master needs nothing: its clock comes from TIM1 compare events driving
+DMA, with software out of the loop entirely.
 
 ## Architecture
 
@@ -355,21 +371,30 @@ ssi/ssi4.c               SSI4 frame codec — pure logic, no hardware
 ssi/ssi_slave.c          generic SSI slave transport (SPI1 + DMA + Tmu gap)
 ```
 
-`ssi_slave` moves *n* bits and knows nothing of their meaning, so SSI1/2/6/9
-(all byte-aligned) can be added as further codecs beside `ssi4.c`.
-`ssi/ssi_master.c` is a bring-up instrument, not part of the emulator.
+"Generic" here means **payload-agnostic, not hardware-agnostic**: `ssi_slave`
+moves *n* bits and knows nothing of their meaning, so SSI1/2/6/9 (all
+byte-aligned) can be added as further codecs beside `ssi4.c`. It is still
+specifically the SPI1-based transport — porting to another peripheral means
+editing it, not swapping a back end.
+
+`ssi/ssi_master.c` is a bring-up instrument, not part of the emulated device.
 
 ### How a Read Cycle is served
 
 1. Between messages PB4 is a plain GPIO holding the SSI idle-HIGH level.
-2. On arming, PB4 is handed to SPI1 (slave, CPOL=1/CPHA=1 — the hardware then
-   changes DATA on the falling edge and the master samples on the rising edge,
-   exactly the SSI relationship). TX DMA feeds the 4 payload bytes.
-3. The **receive** DMA is what counts clocks: its transfer-complete event fires
-   precisely when 32 clocks have been seen, marking end of message.
-4. That ISR takes PB4 back, drives the Error Flag level, and starts TIM6 as a
-   one-shot for Tmu = 20 µs.
-5. TIM6's update returns DATA to HIGH, stages the next frame and re-arms.
+2. On arming, SPI1 is enabled (slave, CPOL=1/CPHA=1 — the hardware then changes
+   DATA on the falling edge and the master samples on the rising edge, exactly
+   the SSI relationship) and TX DMA is loaded with the 4 payload bytes. **PB4
+   stays GPIO**, because the SPI drives MISO LOW while it holds the pin with no
+   clock running, which would break the idle-HIGH requirement.
+3. `EXTI3` fires on the master's **first falling edge** and hands PB4 to SPI1.
+   This is the hard deadline: it must complete within half a clock period.
+4. The **receive** DMA is what counts clocks: its half-transfer event times the
+   clock period, and its transfer-complete event fires precisely when 32 clocks
+   have been seen, marking end of message.
+5. That ISR takes PB4 back, drives the Error Flag level, and starts TIM6 as a
+   one-shot for Tmu less the measured half period and the fixed ISR overhead.
+6. TIM6's update returns DATA to HIGH, stages the next frame and re-arms.
 
 Position and timestamp are latched **together** by the 100 µs update tick, so
 `TS` reports when the position was measured rather than when it was sent.
@@ -379,12 +404,18 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
 | Peripheral | Role | DMA (RM0390 Tables 28/29) |
 |---|---|---|
 | SPI1 slave | SSI DATA shift-out, clock counting | TX DMA2 S3 C3, RX DMA2 S2 C3 |
-| TIM6 | Tmu one-shot gap | — |
+| EXTI3 | first-falling-edge handover of the DATA pin | — |
+| TIM6 | Tmu one-shot gap, 0.1 µs tick | — |
 | TIM7 | Time Stamp counter, 10 µs tick, wraps 2048 | — |
 | TIM2 | 10 kHz update tick + ADC trigger (TRGO) | — |
 | ADC1 IN0 | angle acquisition | DMA2 S0 C0, circular |
 | USART2 | trace/console | TX DMA1 S6 C4 |
-| SPI2 master | loopback harness | polled |
+| **TIM1** | **test-master clock, any 180 MHz / N** | **CH1→DMA2 S1 C6 (clock low), CH3→S6 C6 (clock high), CH4→S4 C6 (sample IDR)** |
+| SPI2 master | `readspi`/`burstspi` cross-check only, polled | — |
+
+The two masters are alternatives, not layers: TIM1 drives the clock pin as plain
+GPIO via DMA writes to `BSRR`, while SPI2 drives it as AF5. Only one owns PB10
+at a time, and the timer engine restores the pin afterwards.
 
 ## Design decisions that are *not* from the specification
 
@@ -413,9 +444,13 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
   emulator presents the maximum the variant allows.
 - **Update rate 10 kHz.** The guide specifies "< 0.1 ms"; 100 µs is the fastest
   value satisfying it.
-- **Error-flag hold time.** The guide holds the Error Flag for `Tmu − 0.5·T`;
-  the emulator holds it for the full `Tmu`, since it does not measure `T`. The
-  difference is at most 5 µs (at the 100 kHz clock limit).
+- **Error-flag hold time.** The guide holds the Error Flag for `Tmu − 0.5·T`.
+  The emulator does measure `T` — from the receive DMA's half-transfer to
+  transfer-complete interval — and sets the gap to `Tmu − 0.5·T` less a fixed
+  interrupt overhead, so Tmu lands inside spec across the whole clock range
+  (verified 19.89 µs at 2 MHz and 20.04 µs at 175.8 kHz). The residual deviation
+  is at the *start* of the gap, not its length: the Error Flag appears ~0.7 µs
+  late because the end-of-frame interrupt has to run first.
 
 ## Known limitations
 
@@ -424,14 +459,15 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
   bit-level padding.
 - Single-turn only; the multi-turn variants (SSI31/32) are not implemented.
 - The EXTI3 handover has a hard deadline: it must set DATA to the SPI output
-  within half a clock period of the first falling edge (250 ns at the 2 MHz
-  maximum, 356 ns at the default 1.4 MHz). It is the highest-priority interrupt
-  in the system for that reason, and it is verified at 2.000 MHz with PV forced
-  to 0 (see `read`). If D31 is ever seen wrong, this is where to look — drop
-  the clock rate to confirm.
+  within half a clock period of the first falling edge — 250 ns at the 2 MHz
+  maximum, 1 µs at the 500 kHz power-on default. It is the highest-priority
+  interrupt in the system for that reason, and is verified at 2.000 MHz with PV
+  forced to 0 (`clk 2000000` then `err on`). If D31 is ever seen wrong, this is
+  where to look — drop the clock rate to confirm.
 - **The handover margin is ~10 % and that is close to inherent.** See
-  "Critical path in SRAM" below for the measurement. Roughly 200 ns of the
+  "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
-- The first `read`/`read` after any state change returns the previously staged
-  frame — the one-cycle latency described above, not an error. Read twice.
+- The first Read Cycle after any state change returns the previously staged
+  frame — the one-cycle latency described above, not an error. `burst` skips two
+  warm-up cycles for this reason; with `read`, just read twice.
