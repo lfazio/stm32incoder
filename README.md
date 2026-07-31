@@ -34,9 +34,13 @@ Console/trace on the ST-LINK virtual COM port, **921600 8N1**:
 stty -F /dev/ttyACM0 921600 raw -echo && cat /dev/ttyACM0
 ```
 
-`-DSIMENC_CLOCK_SOURCE=HSE` switches from the internal 16 MHz RC to the 8 MHz
-ST-LINK MCO (better timestamp accuracy, needs the factory solder bridges of
-UM1724 7.9.1). HSI is the default because it boots regardless of board straps.
+`SIMENC_CLOCK_SOURCE` defaults to **AUTO**: lock the 8 MHz ST-LINK MCO (HSE) if
+the board's solder bridges provide it (UM1724 7.9.1, the factory setting), and
+fall back to the internal 16 MHz RC otherwise. HSE is preferred because HSI
+misses the Time Stamp accuracy specification — see
+[Measured against the specification](#measured-against-the-specification). The
+banner reports which oscillator locked. Force one with
+`-DSIMENC_CLOCK_SOURCE=HSE` (hangs if absent) or `=HSI`.
 
 ## Pin map
 
