@@ -146,6 +146,9 @@ static void stage_frame(void)
 
 /* --- SPI/DMA arming ------------------------------------------------------- */
 
+static inline void spi_configure(void);
+static inline void spi_reset(void);
+
 static void ssi_arm(void)
 {
     SSI_SLAVE_SPI->CR1 &= ~SPI_CR1_SPE;
@@ -157,9 +160,9 @@ static void ssi_arm(void)
 
     DMA2->LIFCR = SSI_RX_CLEAR_FLAGS | SSI_TX_CLEAR_FLAGS;
 
-    /* Drain anything the shift register captured from an aborted cycle. */
-    (void)SSI_SLAVE_SPI->DR;
-    (void)SSI_SLAVE_SPI->SR;
+    /* Reset the peripheral rather than just disabling it, so no byte survives
+     * from an aborted or edge-corrupted cycle. See spi_reset(). */
+    spi_reset();
 
     SSI_TX_STREAM->M0AR = (uint32_t)(uintptr_t)s_tx;
     SSI_TX_STREAM->NDTR = s_nbytes;
@@ -248,17 +251,37 @@ static void gpio_init(void)
     HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 }
 
+/* Slave (MSTR=0), CPOL=1 idle-high clock, CPHA=1 sample on the second (rising)
+ * edge so DATA changes on the falling edge, 8-bit, MSB first. SSM=1 with SSI=0
+ * keeps the slave permanently selected: SSI has no chip select line. */
+static inline void spi_configure(void)
+{
+    SSI_SLAVE_SPI->CR1 = SPI_CR1_CPOL | SPI_CR1_CPHA | SPI_CR1_SSM;
+    SSI_SLAVE_SPI->CR2 = SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN;
+}
+
+/* Full peripheral reset through RCC->APB2RSTR.
+ *
+ * Clearing SPE is not enough to get a clean slate: it does not empty the
+ * transmit buffer. A byte left there is shifted out ahead of the next frame,
+ * so every following Read Cycle arrives one byte late -- and because each
+ * re-arm simply queues four more bytes behind the stale one, the offset
+ * persists until the peripheral is actually reset. That is what the loopback
+ * continuity test used to trigger: it toggles the clock pin, the armed SPI
+ * counts those edges, and a partial byte is stranded. */
+static inline void spi_reset(void)
+{
+    __HAL_RCC_SPI1_FORCE_RESET();
+    __HAL_RCC_SPI1_RELEASE_RESET();
+    spi_configure();
+}
+
 static void spi_init(void)
 {
     __HAL_RCC_SPI1_CLK_ENABLE();
 
     SSI_SLAVE_SPI->CR1 = 0;
-    /* Slave (MSTR=0), CPOL=1 idle-high clock, CPHA=1 sample on the second
-     * (rising) edge so DATA changes on the falling edge, 8-bit, MSB first.
-     * SSM=1 with SSI=0 keeps the slave permanently selected: SSI has no chip
-     * select line. */
-    SSI_SLAVE_SPI->CR1 = SPI_CR1_CPOL | SPI_CR1_CPHA | SPI_CR1_SSM;
-    SSI_SLAVE_SPI->CR2 = SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN;
+    spi_configure();
 }
 
 static void dma_init(void)

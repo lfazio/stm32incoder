@@ -143,13 +143,10 @@ It drives PB10 and PB4 as GPIO and verifies that PB3 and PB14 follow both
 levels, printing `OK` or `OPEN` per wire. `OPEN` means that pin pair is not
 connected, whatever the wire looks like.
 
-> **`wire` leaves the SSI link broken — reset the board before trusting any
-> traffic.** Toggling the clock pin injects edges into the armed SPI, and the
-> byte framing does not recover: every later frame comes back shifted by one
-> byte. Measured on the same build, at 500 kHz: `burst 200 50` gives
-> `ok=198 bad=0` after a reset, and `ok=7 bad=191` if `wire` ran first. Use it
-> to diagnose wiring, then reset. This is a defect in the bring-up instrument,
-> not in the emulator.
+`wire` is safe to run at any time: the slave resets SPI1 through
+`RCC->APB2RSTR` on every arm, so the clock edges the test injects cannot leave
+the byte framing skewed. It used to, and needed a board reset afterwards — see
+"Arming resets the peripheral" below.
 
 Then:
 
@@ -209,6 +206,20 @@ err on
 burst 200 50       # every frame must decode pd=370085 with pv=0
 err off
 ```
+
+### Arming resets the peripheral
+
+`ssi_arm()` resets SPI1 through `RCC->APB2RSTR` rather than merely clearing
+`SPE`, because **clearing `SPE` does not empty the transmit buffer**. A byte
+left there is shifted out ahead of the next frame, so every following Read Cycle
+arrives one byte late — and since each re-arm just queues four more bytes behind
+the stale one, the offset never clears itself.
+
+That was reachable in practice: `wire` toggles the clock pin, the armed SPI
+counted those edges, and a partial byte was stranded. At 500 kHz, `burst 200 50`
+went from `ok=198 bad=0` to `ok=7 bad=191` if `wire` had run first. With the
+reset it is `ok=198 bad=0` either way, and the first Read Cycle after `wire` —
+which used to be reliably wrong — now decodes correctly too.
 
 ### One-cycle data latency is intentional
 
@@ -476,11 +487,6 @@ at a time, and the timer engine restores the pin afterwards.
   "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
-- **`wire` corrupts the link until the next reset** (see "Stage 1"). The
-  suspected cause is that the injected clock edges leave a byte stranded in
-  SPI1's transmit buffer, which `ssi_arm()` cannot flush — disabling `SPE` does
-  not empty it — so every subsequent frame starts one byte late. A full
-  peripheral reset via `RCC->APB2RSTR` is the likely fix; not yet implemented.
 - The first Read Cycle after any state change returns the previously staged
   frame — the one-cycle latency described above, not an error. `burst` skips two
   warm-up cycles for this reason; with `read`, just read twice.
