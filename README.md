@@ -143,6 +143,14 @@ It drives PB10 and PB4 as GPIO and verifies that PB3 and PB14 follow both
 levels, printing `OK` or `OPEN` per wire. `OPEN` means that pin pair is not
 connected, whatever the wire looks like.
 
+> **`wire` leaves the SSI link broken — reset the board before trusting any
+> traffic.** Toggling the clock pin injects edges into the armed SPI, and the
+> byte framing does not recover: every later frame comes back shifted by one
+> byte. Measured on the same build, at 500 kHz: `burst 200 50` gives
+> `ok=198 bad=0` after a reset, and `ok=7 bad=191` if `wire` ran first. Use it
+> to diagnose wiring, then reset. This is a defect in the bring-up instrument,
+> not in the emulator.
+
 Then:
 
 ```
@@ -468,6 +476,11 @@ at a time, and the timer engine restores the pin afterwards.
   "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
+- **`wire` corrupts the link until the next reset** (see "Stage 1"). The
+  suspected cause is that the injected clock edges leave a byte stranded in
+  SPI1's transmit buffer, which `ssi_arm()` cannot flush — disabling `SPE` does
+  not empty it — so every subsequent frame starts one byte late. A full
+  peripheral reset via `RCC->APB2RSTR` is the likely fix; not yet implemented.
 - The first Read Cycle after any state change returns the previously staged
   frame — the one-cycle latency described above, not an error. `burst` skips two
   warm-up cycles for this reason; with `read`, just read twice.

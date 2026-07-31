@@ -5,16 +5,17 @@ project(simenc C ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-set(CUBE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/STM32CubeF4)
-set(CMSIS ${CUBE}/Drivers/CMSIS)
-set(HAL ${CUBE}/Drivers/STM32F4xx_HAL_Driver)
+# ST publishes the Cube package split into per-component repositories. Using
+# those three directly instead of the whole STM32CubeF4 pulls 7 MB of git
+# history rather than 97 MB, and this project only ever compiled these parts.
+set(CMSIS_CORE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/cmsis_core)
+set(CMSIS_DEV  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/cmsis_device_f4)
+set(HAL        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/stm32f4xx_hal_driver)
 
-if(NOT EXISTS ${HAL}/Src/stm32f4xx_hal.c)
+if(NOT EXISTS ${HAL}/Src/stm32f4xx_hal.c OR NOT EXISTS ${CMSIS_CORE}/CMSIS/Core/Include/core_cm4.h)
   message(FATAL_ERROR
-    "STM32CubeF4 submodules are missing. Run:\n"
-    "  git submodule update --init --recursive vendor/STM32CubeF4\n"
-    "  git -C vendor/STM32CubeF4 submodule update --init --depth 1 \\\n"
-    "      Drivers/CMSIS/Device/ST/STM32F4xx Drivers/STM32F4xx_HAL_Driver")
+    "Vendor submodules are missing. Run:\n"
+    "  git submodule update --init")
 endif()
 
 # --- Clock source -------------------------------------------------------------
@@ -64,8 +65,8 @@ add_executable(simenc.elf
 
 target_include_directories(simenc.elf PRIVATE
     src
-    ${CMSIS}/Include
-    ${CMSIS}/Device/ST/STM32F4xx/Include
+    ${CMSIS_CORE}/CMSIS/Core/Include
+    ${CMSIS_DEV}/Include
     ${HAL}/Inc
 )
 
