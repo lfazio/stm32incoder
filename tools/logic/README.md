@@ -27,7 +27,20 @@ python3 analyse.py out_pv0/digital.csv "PV=0" 370085 0
   capture time. **Use a long span** (`burst 400 1000` at 25 MS/s): over 13 ms
   the Read Cycle period beats against the 100 us update tick and the answer is
   biased by a factor of two.
+- `variants.py` — variant-aware check: clocks per cycle, Tmu, gap level, and a
+  payload decode written straight from Product Guide 5.4.2, independent of the
+  firmware. It recomputes SSI2's parity and SSI6's CRC-8 itself, so those are
+  verified against a second implementation rather than round-tripped.
+
+  ```sh
+  ./cap2.sh cap_ssi1 "burst 100 50" 0.025 125000000
+  python3 variants.py cap_ssi1/digital.csv ssi1 24 74565
+  ```
 - `svg2.py` — renders the two-panel figure used in the top-level README.
+
+`cap2.sh` does not set the position: send `fixed <value>` yourself before
+calling it, and pass the same value to the analysis. It used to force
+`0x5A5A5`, which silently contradicted whatever the caller had just set.
 
 The measured figures in the top-level README name the commit they were taken
 against. Re-run these after changing anything in the SSI path.

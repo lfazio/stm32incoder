@@ -91,6 +91,7 @@ static volatile uint32_t     s_moder_af;
  * cycle counts give T for free:  T = (t_TC - t_HT) / (n_bits/2).
  */
 static volatile uint32_t     s_t_half;         /* DWT cycles at half transfer */
+static volatile uint32_t     s_ht_bits;        /* bits already clocked in at that point */
 static volatile uint32_t     s_period_ns;      /* measured clock period T */
 static volatile bool         s_period_valid;
 
@@ -462,6 +463,11 @@ void DMA2_Stream2_IRQHandler(void)
     if (DMA2->LISR & DMA_LISR_HTIF2) {
         DMA2->LIFCR = DMA_LIFCR_CHTIF2;
         s_t_half = DWT->CYCCNT;
+        /* Read how far the transfer actually got rather than assuming half.
+         * For an odd byte count -- n=24 is three bytes -- the half-transfer
+         * event does not land on n_bits/2, and assuming it does under-measures
+         * T and leaves the gap long. */
+        s_ht_bits = (uint32_t)(s_nbytes - (uint8_t)SSI_RX_STREAM->NDTR) * 8u;
     }
 
     if (DMA2->LISR & DMA_LISR_TCIF2) {
@@ -472,12 +478,16 @@ void DMA2_Stream2_IRQHandler(void)
         /* elapsed spans exactly n_bits/2 clock periods (half transfer to
          * transfer complete). Guard against a wildly out-of-range value from
          * an aborted cycle before trusting it. */
-        uint32_t halfbits = s_cfg.n_bits / 2u;
+        /* The interval spans however many clocks remained after the
+         * half-transfer event, which s_ht_bits records exactly. */
+        uint32_t span = (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits)
+                      ? (uint32_t)(s_cfg.n_bits - s_ht_bits)
+                      : (uint32_t)(s_cfg.n_bits / 2u);
         /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- doing it
          * the other way truncates to 5 and reports every period 10% short.
          * Worst case 16 periods at 100 kHz is 288000 cycles, so x1000 still
          * fits comfortably in 32 bits. */
-        uint32_t per_ns   = (elapsed * 1000u) / (halfbits * (SYSCLK_HZ / 1000000u));
+        uint32_t per_ns   = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
         if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
             s_period_ns    = per_ns;
             s_period_valid = true;

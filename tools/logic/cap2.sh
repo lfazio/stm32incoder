@@ -1,7 +1,7 @@
 #!/bin/bash
 # cap2.sh <outdir> <console-cmd> <afterTriggerSeconds> <rate>
 stty -F /dev/ttyACM0 921600 raw -echo -crtscts
-printf 'fixed 0x5A5A5\r' > /dev/ttyACM0; sleep 0.6
+# value is set by the caller, not here
 python3 - "$1" "$2" "$3" "$4" <<'PY'
 import sys,time,os
 sys.path.insert(0,'.')

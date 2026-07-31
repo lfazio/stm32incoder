@@ -145,6 +145,22 @@ ssi9  C91A2B92    as ssi4, TS counting in 1 µs steps
 SSI7 (n=30) and SSI8 (n=18) are **not** implemented: they are not byte aligned,
 and `ssi_slave` transfers whole bytes.
 
+Checked on the analyser at 500 kHz, 100 Read Cycles each, with the payload
+decoded independently in `tools/logic/variants.py` — parity and CRC recomputed
+there rather than trusted from the firmware:
+
+| Variant | clocks/cycle | Tmu | frames | integrity |
+|---|---|---|---|---|
+| SSI1 | 24 × 100 | 20.13 µs | pass | — |
+| SSI2 | 24 × 100 | 20.34 µs | pass | parity ✓ |
+| SSI4 | 32 × 100 | 20.03 µs | pass | — |
+| SSI6 | 32 × 100 | 20.04 µs | pass | CRC-8 ✓ |
+| SSI9 | 32 × 100 | 20.02 µs | pass | — |
+
+The independent CRC-8 of the SSI6 body `0xC12345` is `0xDF`, which is what the
+firmware emitted — so that field is now confirmed against a second
+implementation of the guide's parameters, not just round-tripped.
+
 **The SSI6 CRC is computed in software, and has to be.** The STM32F446 has a CRC
 peripheral, but RM0390 4.1 describes "a *fixed* generator polynomial" and 4.2
 names it: "CRC-32 (Ethernet) polynomial: 0x4C11DB7". There is no `CRC_POL` or
