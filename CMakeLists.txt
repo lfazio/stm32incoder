@@ -18,11 +18,16 @@ if(NOT EXISTS ${HAL}/Src/stm32f4xx_hal.c)
 endif()
 
 # --- Clock source -------------------------------------------------------------
-# HSI (default): 16 MHz internal RC. Always boots regardless of board solder
-# bridges. HSE: 8 MHz from the ST-LINK MCO (UM1724 7.9.1) -- better timestamp
-# accuracy, but requires SB54/SB16/SB50 ON and SB55 OFF (factory default).
-set(SIMENC_CLOCK_SOURCE "HSI" CACHE STRING "System clock source: HSI or HSE")
-set_property(CACHE SIMENC_CLOCK_SOURCE PROPERTY STRINGS HSI HSE)
+# AUTO (default): try HSE (8 MHz from the ST-LINK MCO, UM1724 7.9.1) and fall
+# back to HSI if the board's solder bridges do not provide it.
+#
+# HSE matters: the SSI4 Time Stamp is specified accurate to "better than 1%
+# (based on the system oscillator)", and measured against a logic analyser HSI
+# is +1.40% (out of spec) while HSE is +0.02%.
+#
+# Force one with -DSIMENC_CLOCK_SOURCE=HSE (hang if absent) or =HSI.
+set(SIMENC_CLOCK_SOURCE "AUTO" CACHE STRING "System clock source: AUTO, HSE or HSI")
+set_property(CACHE SIMENC_CLOCK_SOURCE PROPERTY STRINGS AUTO HSE HSI)
 
 set(HAL_MODULES
     hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr

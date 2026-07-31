@@ -159,9 +159,14 @@ the Error Flag both ways, 200/200 payloads correct, and the EXTI3 handover
 measured at 184-232 ns against its 250 ns budget. See README "Measured against
 the specification" for the numbers and the three things the capture changed.
 
-Note the capture also showed the clock running 1.37% fast, which is the HSI RC.
-The Time Stamp is specified to "better than 1%", so an HSI build does not meet
-it -- use -DSIMENC_CLOCK_SOURCE=HSE when timestamp accuracy matters.
+Time Stamp accuracy was then measured directly, by regressing the decoded TS
+field against capture time over a 0.4 s span: HSI is **+1.401%** (fails the
+"better than 1%" specification) and HSE is **+0.021%**. `SIMENC_CLOCK_SOURCE`
+therefore defaults to `AUTO` -- try HSE, fall back to HSI -- and the banner
+reports which locked, flagging `[timestamp OUT OF SPEC]` on the fallback.
+
+Measure that over a long span: 13 ms gave a spurious +3.16% for HSI because the
+Read Cycle period beats against the 100 us update tick that latches TS.
 
 Still to do: the same run through two MAX490 modules at RS-422.
 

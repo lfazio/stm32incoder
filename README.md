@@ -199,11 +199,23 @@ Three things this capture actually changed:
 - **The handover margin is thin.** 232 ns worst case against a 250 ns budget is
   about 7 %. It passes, but it is not the comfortable margin estimated before
   measuring.
-- **The clock is 1.37 % fast** (493 ns rather than 500 ns), which is the HSI RC
-  oscillator, not the timer. The Time Stamp field is specified accurate to
-  "better than 1 % (based on the system oscillator)", so **an HSI build does not
-  meet the timestamp accuracy**. Build with `-DSIMENC_CLOCK_SOURCE=HSE` for
-  spec-compliant timestamps.
+- **HSI cannot meet the Time Stamp accuracy, so HSE is now the default.**
+  The field is specified accurate to "better than 1 % (based on the system
+  oscillator)". Measured directly against the analyser's crystal by regressing
+  the decoded TS field against capture time over a 0.4 s span:
+
+  | Clock source | Clock period | Time Stamp tick | Accuracy | Spec (< 1 %) |
+  |---|---|---|---|---|
+  | HSI, 16 MHz RC | 493.02 ns | 9.8619 µs | **+1.401 %** | ✗ FAIL |
+  | HSE, 8 MHz ST-LINK MCO | 500.03 ns | 9.9979 µs | **+0.021 %** | ✓ PASS |
+
+  `SIMENC_CLOCK_SOURCE` now defaults to `AUTO`: try HSE, fall back to HSI if the
+  board's solder bridges do not route the MCO. The banner reports which one
+  locked, and flags `[timestamp OUT OF SPEC]` when it had to fall back.
+
+  Measure this over a long span. A first attempt across only 13 ms gave a
+  spurious +3.16 % for HSI, because the ~90 µs Read Cycle period beats against
+  the 100 µs position-update tick that latches TS.
 
 ## Architecture
 

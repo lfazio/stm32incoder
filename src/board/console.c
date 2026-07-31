@@ -111,7 +111,10 @@ void console_init(void)
 void console_banner(void)
 {
     trace_printf("\r\n=== simenc: Zettlex IncOder emulator (SSI4) ===\r\n");
-    trace_printf("board   : NUCLEO-F446RE @ %lu MHz\r\n", (unsigned long)(SYSCLK_HZ / 1000000u));
+    trace_printf("board   : NUCLEO-F446RE @ %lu MHz, clock %s%s\r\n",
+                 (unsigned long)(SYSCLK_HZ / 1000000u),
+                 board_clock_source_name(),
+                 board_timestamp_in_spec() ? "" : "  [timestamp OUT OF SPEC]");
     trace_printf("SSI slave: CLK=PB3(D3) DATA=PB4(D5)   n=%u bits, Tmu=20us\r\n",
                  (unsigned)SSI4_FRAME_BITS);
     trace_printf("SSI master(test): CLK=PB10(D6) DATA=PB14(CN10-28) @ %lu Hz\r\n",

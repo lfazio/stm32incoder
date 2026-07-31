@@ -85,6 +85,15 @@
 #define APB1_TIMCLK_HZ           90000000u   /* APB1 prescaler != 1 -> x2 */
 #define APB2_TIMCLK_HZ           180000000u  /* APB2 prescaler != 1 -> x2 */
 
+/* Which oscillator the PLL actually locked to. This determines whether the
+ * Time Stamp field can meet its "better than 1%" accuracy: measured +0.02% on
+ * HSE and +1.40% on HSI. */
+typedef enum { CLK_SRC_HSE = 0, CLK_SRC_HSI } clock_source_t;
+
+clock_source_t board_clock_source(void);
+const char    *board_clock_source_name(void);
+bool           board_timestamp_in_spec(void);
+
 void board_init(void);
 void board_led_set(bool on);
 void board_led_toggle(void);
