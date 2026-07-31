@@ -9,13 +9,13 @@ console. Set the device id in `cap2.sh` to match `get_devices`.
 
 ```sh
 # one Read Cycle burst at 2 MHz, PV valid
-./cap2.sh out_pv1 "burst2m 200 50" 0.025 125000000
+./cap2.sh out_pv1 "clk 2000000; burst 200 50" 0.025 125000000
 python3 analyse.py out_pv1/digital.csv "PV=1" 370085 1
 
 # same with PV forced to 0 -- required to see the first-bit handover, because
 # PV is normally 1 and the line also idles HIGH
 printf 'err on\r' > /dev/ttyACM0
-./cap2.sh out_pv0 "burst2m 200 50" 0.025 125000000
+./cap2.sh out_pv0 "burst 200 50" 0.025 125000000
 python3 analyse.py out_pv0/digital.csv "PV=0" 370085 0
 ```
 
@@ -24,7 +24,7 @@ python3 analyse.py out_pv0/digital.csv "PV=0" 370085 0
 - `hand.py` — handover distribution and margin against the half-period budget.
   Use it to compare `-DSIMENC_RAMFUNC=ON/OFF`.
 - `ts_acc.py` — Time Stamp accuracy, by regressing the decoded TS field against
-  capture time. **Use a long span** (`burst2m 400 1000` at 25 MS/s): over 13 ms
+  capture time. **Use a long span** (`burst 400 1000` at 25 MS/s): over 13 ms
   the Read Cycle period beats against the 100 us update tick and the answer is
   biased by a factor of two.
 - `svg2.py` — renders the two-panel figure used in the top-level README.

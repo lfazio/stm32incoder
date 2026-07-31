@@ -32,7 +32,8 @@ uint32_t ssi_master_get_clock(void);
 
 void ssi_master_delay_us(uint32_t us);
 
-/* Runs one Read Cycle at exactly 2.000 MHz, the SSI maximum.
+/* Runs one Read Cycle at the timer-generated clock rate (see
+ * ssi_master_set_exact_clock; 2.000 MHz by default, the SSI maximum).
  *
  * The SPI baud generator cannot produce it: SPI2 is clocked from PCLK1 =
  * 45 MHz and divides by powers of two, so the closest legal rates are
@@ -44,14 +45,20 @@ void ssi_master_delay_us(uint32_t us);
  * The pin assignment and wiring are unchanged; only the pin's mode differs
  * while this engine runs.
  *
- * This is the worst case for the slave: its EXTI3 handover has just half a
- * clock period, 250 ns, to put DATA on the line before the master samples. */
-bool     ssi_master_read_2mhz(uint8_t n_bits, uint32_t *raw);
+ * At the 2 MHz top of the range this is the worst case for the slave: its EXTI3
+ * handover then has just half a clock period, 250 ns, to put DATA on the line
+ * before the master samples. */
+bool     ssi_master_read_timer(uint8_t n_bits, uint32_t *raw);
 uint32_t ssi_master_exact_hz(void);
 
-/* Post-mortem of the last 2 MHz burst: NDTR of the low/high/sample streams,
+/* Sets the timer-generated rate. Unlike the SPI baud generator, which only
+ * reaches four rates inside the SSI window, this covers the whole 100 kHz ..
+ * 2 MHz range in steps of 180 MHz / N. Returns the rate actually programmed. */
+uint32_t ssi_master_set_exact_clock(uint32_t requested_hz);
+
+/* Post-mortem of the last timer-engine burst: NDTR of the low/high/sample streams,
  * then TIM1 CNT, TIM1 SR, DMA2 LISR, DMA2 HISR. */
-void ssi_master_2mhz_debug(uint32_t *out7);
+void ssi_master_timer_debug(uint32_t *out7);
 
 /* Continuity self-test for the loopback jumpers.
  *

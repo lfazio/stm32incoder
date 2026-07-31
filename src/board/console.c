@@ -118,29 +118,32 @@ void console_banner(void)
     trace_printf("SSI slave: CLK=PB3(D3) DATA=PB4(D5)   n=%u bits, Tmu=20us\r\n",
                  (unsigned)SSI4_FRAME_BITS);
     trace_printf("SSI master(test): CLK=PB10(D6) DATA=PB14(CN10-28) @ %lu Hz\r\n",
-                 (unsigned long)ssi_master_get_clock());
+                 (unsigned long)ssi_master_exact_hz());
     trace_printf("angle in : PA0 (A0), 0..VDDA -> 0..%lu counts\r\n",
                  (unsigned long)SSI4_POSITION_MAX);
     trace_printf("type 'help' for commands\r\n");
 }
 
+/* One trace_printf per line: the whole listing is far longer than
+ * trace_printf's 192-byte stack buffer, which silently truncated it. */
 static void cmd_help(void)
 {
-    trace_printf(
-        "commands:\r\n"
-        "  stat              show encoder + link state\r\n"
-        "  src adc|fixed|ramp   select position source (bypasses ADC)\r\n"
-        "  fixed <counts>    set POS_SRC_FIXED value (0..%lu)\r\n"
-        "  ramp <step>       counts added per 100us update\r\n"
-        "  zero set|reset    zero point set / restore factory (ZPD)\r\n"
-        "  clk <hz>          SSI master test clock (100k..2M)\r\n"
-        "  wire              check the loopback jumpers for continuity\r\n"
-        "  read [n]          run n master Read Cycles and decode\r\n"
-        "  read2m [n]        same, clocked at exactly 2 MHz (SSI maximum)\r\n"
-        "  err on|off        force PV=0; makes D31 a meaningful test bit\r\n"
-        "  burst [n] [gapus]    n back-to-back cycles, no tracing between\r\n"
-        "  burst2m [n] [gapus]  same at 2 MHz -- use these for scope capture\r\n",
-        (unsigned long)SSI4_POSITION_MAX);
+    trace_printf("commands:\r\n");
+    trace_printf("  help                 this list\r\n");
+    trace_printf("  stat                 encoder + link state\r\n");
+    trace_printf("  src adc|fixed|ramp   position source; adc is the default\r\n");
+    trace_printf("  fixed <counts>       fixed position 0..%lu, selects 'fixed'\r\n",
+                 (unsigned long)SSI4_POSITION_MAX);
+    trace_printf("  ramp <step>          counts per 100us update, selects 'ramp'\r\n");
+    trace_printf("  zero set|reset       zero point; reset restores factory (ZPD=1)\r\n");
+    trace_printf("  err on|off           force PV=0; makes D31 a meaningful test bit\r\n");
+    trace_printf("test master (loopback only):\r\n");
+    trace_printf("  wire                 check the loopback jumpers for continuity\r\n");
+    trace_printf("  clk <hz>             clock rate, any value 100k..2M (timer)\r\n");
+    trace_printf("  read [n]             n Read Cycles, decode each\r\n");
+    trace_printf("  burst [n] [gapus]    n cycles, no tracing between; for capture\r\n");
+    trace_printf("  readspi [n]          read via the SPI baud generator\r\n");
+    trace_printf("  burstspi [n] [gapus] burst via the SPI baud generator\r\n");
 }
 
 static void cmd_stat(void)
@@ -174,7 +177,7 @@ static void cmd_read(uint32_t count, bool fast)
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t raw = 0;
-        bool ok = fast ? ssi_master_read_2mhz(SSI4_FRAME_BITS, &raw)
+        bool ok = fast ? ssi_master_read_timer(SSI4_FRAME_BITS, &raw)
                        : ssi_master_read(SSI4_FRAME_BITS, &raw);
 
         if (!ok) {
@@ -209,27 +212,35 @@ static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
         gap_us = 25u;      /* Timg must exceed Tmu = 20 us */
     }
 
+    /* Two warm-up cycles, not one. A frame is staged at the end of Tmu, so
+     * after a value change the *first two* cycles can still carry the old
+     * payload: cycle 0 was staged before the change, and cycle 1 may have been
+     * staged before the console command finished. Taking the reference from
+     * cycle 1 made every subsequent correct frame count as bad -- an ok=1
+     * bad=38 that looked like a link failure and was purely this. */
+    const uint32_t warmup = (count > 2u) ? 2u : 0u;
+
     for (uint32_t i = 0; i < count; i++) {
         uint32_t raw = 0;
-        bool got = fast ? ssi_master_read_2mhz(SSI4_FRAME_BITS, &raw)
+        bool got = fast ? ssi_master_read_timer(SSI4_FRAME_BITS, &raw)
                         : ssi_master_read(SSI4_FRAME_BITS, &raw);
+        if (i < warmup) {
+            ssi_master_delay_us(gap_us);
+            continue;
+        }
         if (!got) {
             bad++;
         } else {
             ssi4_frame_t f;
             ssi4_unpack(raw, &f);
-            /* The first cycle can carry the previously staged frame, so the
-             * reference is the second one. */
-            if (!have_first && i > 0u) {
+            if (!have_first) {
                 first = f.pd;
                 have_first = true;
                 ok++;
-            } else if (have_first) {
-                if (f.pd == first) {
-                    ok++;
-                } else {
-                    bad++;
-                }
+            } else if (f.pd == first) {
+                ok++;
+            } else {
+                bad++;
             }
         }
         ssi_master_delay_us(gap_us);
@@ -300,8 +311,15 @@ static void handle_line(char *line)
             trace_printf("bad number '%s'\r\n", arg);
             return;
         }
-        trace_printf("master clock = %lu Hz\r\n",
-                     (unsigned long)ssi_master_set_clock(req));
+        /* The timer engine reaches 180 MHz / N, so anything in the SSI window
+         * is available -- not just the SPI baud generator's four rates. */
+        uint32_t got = ssi_master_set_exact_clock(req);
+        uint32_t spi = ssi_master_set_clock(req);
+        long err_ppt = (req != 0u)
+            ? (long)(((int64_t)got - (int64_t)req) * 1000 / (int64_t)req) : 0;
+        trace_printf("master clock = %lu Hz (timer, %+ld.%ld%%)  spi fallback %lu Hz\r\n",
+                     (unsigned long)got, err_ppt / 10, (err_ppt < 0 ? -err_ppt : err_ppt) % 10,
+                     (unsigned long)spi);
     } else if (strcmp(cmd, "wire") == 0) {
         bool ck = false;
         bool dt = false;
@@ -313,21 +331,21 @@ static void handle_line(char *line)
                      dt ? "OK" : "OPEN");
         trace_printf("loopback %s\r\n", ok ? "ready" : "NOT wired");
         ssi_slave_start();      /* the test borrowed the DATA pin */
-    } else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "read2m") == 0) {
+    } else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "readspi") == 0) {
         uint32_t n    = 1u;
-        bool     fast = (strcmp(cmd, "read2m") == 0);
+        bool     fast = (strcmp(cmd, "readspi") != 0);
         if (arg != NULL && !parse_u32(arg, &n)) {
             trace_printf("bad number '%s'\r\n", arg);
             return;
         }
-        if (fast) {
-            trace_printf("clocking at %lu Hz (SSI maximum)\r\n",
-                         (unsigned long)ssi_master_exact_hz());
-        }
+        trace_printf("clocking at %lu Hz (%s)\r\n",
+                     (unsigned long)(fast ? ssi_master_exact_hz()
+                                          : ssi_master_get_clock()),
+                     fast ? "timer" : "spi");
         cmd_read(n, fast);
         if (fast) {
             uint32_t d[7];
-            ssi_master_2mhz_debug(d);
+            ssi_master_timer_debug(d);
             trace_printf("  ndtr lo=%lu hi=%lu smp=%lu  tim cnt=%lu sr=%08lX\r\n",
                          (unsigned long)d[0], (unsigned long)d[1],
                          (unsigned long)d[2], (unsigned long)d[3],
@@ -335,9 +353,9 @@ static void handle_line(char *line)
             trace_printf("  dma2 lisr=%08lX hisr=%08lX\r\n",
                          (unsigned long)d[5], (unsigned long)d[6]);
         }
-    } else if (strcmp(cmd, "burst") == 0 || strcmp(cmd, "burst2m") == 0) {
+    } else if (strcmp(cmd, "burst") == 0 || strcmp(cmd, "burstspi") == 0) {
         uint32_t n    = 50u;
-        bool     fast = (strcmp(cmd, "burst2m") == 0);
+        bool     fast = (strcmp(cmd, "burstspi") != 0);
         char    *gap  = next_token(&cursor);
         uint32_t g    = 100u;
 
