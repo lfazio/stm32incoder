@@ -181,19 +181,27 @@ Captured with a Saleae Logic Pro 16 at 125 MS/s (8 ns resolution), 3.3 V
 threshold, falling-edge trigger on the clock: `burst2m 200 50` with
 `fixed 0x5A5A5`, run once with PV=1 and once with `err on`.
 
+**These numbers are measured against commit `be94f25`** (HSE clock, critical path
+in SRAM, dynamic Tmu correction). Re-capture after touching the SSI path — an
+earlier revision of this table was silently stale for exactly that reason.
+
 ![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
 
 | Property | Specified | Measured (200 Read Cycles) |
 |---|---|---|
 | Clocks per message | n = 32 | **32 on every cycle** |
-| Clock rate | 100 kHz … 2 MHz | 2.027 MHz (period 493 ns mean, 440–544 ns) |
-| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.94 µs mean, 20.09 µs max** |
+| Clock rate | 100 kHz … 2 MHz | 1.9997 MHz (period 500.07 ns mean) |
+| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.89 µs mean, 20.06 µs max** |
 | Idle state | CLOCK and DATA HIGH | HIGH |
-| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×199 under `err on`** |
-| Payload | PD = 370085 (0x5A5A5) | **200/200 decode correctly** |
-| First falling edge → DATA valid | < 0.5·T = 250 ns | **184–232 ns, 201 ns mean** |
+| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×199; **HIGH ×199 under `err on`** |
+| Payload | PD = 370085 (0x5A5A5) | **199/199 decode correctly** |
+| First falling edge → DATA valid | < 0.5·T = 250 ns | **200–224 ns, 209 ns mean** |
 
-Three things this capture actually changed:
+Both runs show one non-matching first frame. That is the documented one-cycle
+staging latency — the frame was staged before the preceding `err` command took
+effect — not a decode failure; every subsequent cycle is correct.
+
+What measuring actually changed:
 
 - **Tmu was out of spec** at 21.01 µs, because end-of-message is detected on the
   last *rising* edge — half a clock period after the falling edge the
@@ -218,9 +226,9 @@ Three things this capture actually changed:
   that long. It is 3.5 % of the Tmu window, and SSI4 carries validity in PV
   inside the frame rather than in the trailing flag, but a controller that
   samples the Error Flag very early would read the last data bit instead.
-- **The handover margin is thin.** 232 ns worst case against a 250 ns budget is
-  about 7 %. It passes, but it is not the comfortable margin estimated before
-  measuring.
+- **The handover margin is thin.** 224 ns worst case against a 250 ns budget is
+  about 10 %, after moving the handler to SRAM (it was 232 ns / 7 % in flash).
+  It passes, but it is not the comfortable margin estimated before measuring.
 - **HSI cannot meet the Time Stamp accuracy, so HSE is now the default.**
   The field is specified accurate to "better than 1 % (based on the system
   oscillator)". Measured directly against the analyser's crystal by regressing
