@@ -1,4 +1,4 @@
-# simenc — Zettlex IncOder emulator (SSI4) on NUCLEO-F446RE
+# stm32incoder — Zettlex IncOder emulator (SSI4) on NUCLEO-F446RE
 
 Emulates a Zettlex/Celera Motion IncOder inductive angle encoder speaking the
 **SSI4** protocol variant, on a NUCLEO-F446RE. The shaft angle comes from one
