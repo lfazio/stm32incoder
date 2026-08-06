@@ -78,13 +78,21 @@
  * is what 5.4.1 note 2 describes, and the bit is then valid across the falling
  * edge where the controller samples it.
  *
- * TIM3_UP -> DMA1 Stream 2, Channel 5 [RM0390 Rev 9 Table 28]. Stream 2 shares
- * that cell with TIM3_CH4, which is unused here. USART2_TX for the trace is
- * Stream 6 Channel 4, so there is no conflict.
+ * The request is TIM3_TRIG, not TIM3_UP: the update event fires once per n
+ * counts, and forcing one per edge would need ARR=0, which RM0390 says blocks
+ * the counter outright. The trigger event fires on every ETR edge.
+ *
+ * TIM3_TRIG -> DMA1 **Stream 4**, Channel 5 [RM0390 Rev 9 Table 28], sharing
+ * that cell with TIM3_CH1. Note Stream 2 on the same channel carries TIM3_UP
+ * and TIM3_CH4 -- a different request. Picking the stream to match the event
+ * is not optional: with the stream on 2 and the source set to trigger, the
+ * timer counts and sets TIF while the DMA never moves at all.
+ *
+ * USART2_TX for the trace is Stream 6 Channel 4, so there is no conflict.
  */
-#define SSI_DATA_DMA_STREAM      DMA1_Stream2
+#define SSI_DATA_DMA_STREAM      DMA1_Stream4
 #define SSI_DATA_DMA_CHANNEL     5u
-#define SSI_DATA_DMA_IRQn        DMA1_Stream2_IRQn
+#define SSI_DATA_DMA_IRQn        DMA1_Stream4_IRQn
 #define SSI_DATA_BSRR            (&GPIOB->BSRR)
 
 #define SSI_MASTER_SPI           SPI2

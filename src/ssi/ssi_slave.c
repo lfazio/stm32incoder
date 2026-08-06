@@ -70,6 +70,14 @@
  * yet (see SSI_ETR_PIN), and without it the counter never counts and the link
  * stops dead. Hence opt-in, and hence the default is unchanged.
  */
+#if defined(SIMENC_TIMER_DATA)
+/* The DATA stream is 4, whose flags live in the HIGH interrupt registers --
+ * unlike the SPI streams above, which are 2 and 3 and use the LOW ones. */
+#define SSI_DATA_CLEAR_FLAGS (DMA_HIFCR_CTCIF4 | DMA_HIFCR_CHTIF4 | \
+                              DMA_HIFCR_CTEIF4 | DMA_HIFCR_CDMEIF4 | \
+                              DMA_HIFCR_CFEIF4)
+#endif
+
 #if defined(SIMENC_CLOCK_COUNTER)
 #define CLK_TIM         SSI_ETR_TIM
 #define CLK_TIM_IRQn    SSI_ETR_TIM_IRQn
@@ -227,10 +235,23 @@ static inline void clock_counter_arm(void);
  * 250 ns deadline. The first rising edge writes D(n-1) by itself. */
 static void ssi_arm(void)
 {
+    /* Silence the request source before touching the stream.
+     *
+     * TIM3 free-runs with ARR=0, so every counted edge is an update and every
+     * update is a DMA request. Reloading the stream while that source is still
+     * live leaves a request able to appear across the re-arm -- and a request
+     * raised while the stream is disabled is simply lost, after which the
+     * stream sits at its reload value and never moves again. That is the
+     * observed failure: one good message, then NDTR parked at n with the
+     * watchdog seeing an idle count and nothing to resync. Mask UDE first, and
+     * unmask only once the stream is loaded and enabled. */
+    CLK_TIM->CR1  &= ~TIM_CR1_CEN;
+    CLK_TIM->DIER &= ~TIM_DIER_TDE;
+    CLK_TIM->SR    = 0;
+
     SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
     while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
-    DMA1->LIFCR = DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
-                  DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+    DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
 
     SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
     SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
@@ -238,7 +259,10 @@ static void ssi_arm(void)
 
     /* The gap level is already on the pin; leave it there until the first
      * rising edge overwrites it with D(n-1). */
-    clock_counter_arm();
+    CLK_TIM->CNT   = 0;
+    CLK_TIM->SR    = 0;
+    CLK_TIM->DIER |= TIM_DIER_TDE;
+    CLK_TIM->CR1  |= TIM_CR1_CEN;
     s_armed = true;
 }
 #else
@@ -467,27 +491,36 @@ static void clock_counter_init(void)
 
     CLK_TIM->CR1 = 0;
     CLK_TIM->PSC = 0;                      /* count every edge, not every Nth */
-#if defined(SIMENC_TIMER_DATA)
-    /* ARR=0 so every counted rising edge raises an update event, and every
-     * update event is one DMA request -- one bit onto the bus per rising edge.
-     * End of message is then the DMA's transfer-complete after n of them, so
-     * this timer no longer needs to count to n itself. */
-    CLK_TIM->ARR = 0u;
-#else
+    /* Never 0. RM0390: "The counter is blocked while the auto-reload value is
+     * null" -- with ARR=0 the timer does not count at all, raises no events and
+     * requests no DMA. It looks perfectly configured while doing nothing, which
+     * cost a debugging session: every register read back correct and NDTR sat
+     * at n through a 5000-cycle burst. */
     CLK_TIM->ARR = (uint32_t)s_cfg.n_bits - 1u;
-#endif
 
+#if defined(SIMENC_TIMER_DATA)
+    /* External clock mode 1: SMS=111 with TS=111 (ETRF) clocks the counter from
+     * ETR *and* makes every edge a trigger event. That matters because the DMA
+     * request has to come per edge, and the update event cannot supply it --
+     * update fires once per n counts, and forcing it per edge would need ARR=0,
+     * which blocks the counter outright. TDE turns each trigger event into one
+     * DMA request, so one rising edge writes one bit, whatever ARR is.
+     * ETP=0 selects rising edges: the edge the encoder shifts on. */
+    CLK_TIM->SMCR = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
+                  | TIM_SMCR_TS_0  | TIM_SMCR_TS_1  | TIM_SMCR_TS_2;
+#else
     /* External clock mode 2 (RM0390 17.3.12): ECE=1 clocks the counter from
      * ETRF. ETP=0 counts rising edges, which is where the receive DMA completes
      * today. No ETR prescaler and no filter: the filter samples ETR over
      * several clocks and would delay the update event, and the gap this event
      * starts is what has to land inside 20 us +/- 1 us. */
     CLK_TIM->SMCR = TIM_SMCR_ECE;
+#endif
 
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
 #if defined(SIMENC_TIMER_DATA)
-    CLK_TIM->DIER = TIM_DIER_UDE;          /* DMA request, no interrupt */
+    CLK_TIM->DIER = TIM_DIER_TDE;          /* one DMA request per clock edge */
 #else
     CLK_TIM->DIER = TIM_DIER_UIE;
 #endif
@@ -541,20 +574,24 @@ static void data_dma_init(void)
 
 /* End of message: the DMA has written all n bits, so the last rising edge has
  * just happened. 5.4.1 note 3 puts the Error Flag here. */
-void DMA1_Stream2_IRQHandler(void)
+void DMA1_Stream4_IRQHandler(void)
 {
-    if (DMA1->LISR & DMA_LISR_TCIF2) {
-        DMA1->LIFCR = DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
-                      DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+    if (DMA1->HISR & DMA_HISR_TCIF4) {
+        /* Stop the request source in the same breath as ending the message, so
+         * nothing can be raised during the gap that survives into the re-arm. */
+        CLK_TIM->CR1  &= ~TIM_CR1_CEN;
+        CLK_TIM->DIER &= ~TIM_DIER_TDE;
+
         data_drive(s_gap_level);
+
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+        DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
         s_armed = false;
         s_frames++;
         s_clk_counted = true;
         gap_timer_start();
     } else {
-        DMA1->LIFCR = DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
-                      DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+        DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
     }
 }
 #endif /* SIMENC_TIMER_DATA */
