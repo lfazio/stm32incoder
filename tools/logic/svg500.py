@@ -39,15 +39,16 @@ T=(c[-1]-c[0])/(len(c)-1)                      # clock period, measured
 # so the offset is all that changes.
 MODE   = sys.argv[3] if len(sys.argv) > 3 else "falling"
 RISING = MODE in ("rising", "timer")
+RATE = sys.argv[4] if len(sys.argv) > 4 else "500 kHz"
 TITLE = {
- "falling": "One complete SSI4 Read Cycle at 500 kHz — the ordinary operating point",
- "rising":  "DATA on the rising edge (SIMENC_RISING_EDGE) — one Read Cycle at 500 kHz",
- "timer":   "DATA shifted by the clock itself (SIMENC_TIMER_DATA) — one Read Cycle at 500 kHz",
+ "falling": f"One complete SSI4 Read Cycle at {RATE} — SPI fallback, DATA on the falling edge",
+ "rising":  f"DATA on the rising edge (SIMENC_RISING_EDGE) — one Read Cycle at {RATE}",
+ "timer":   f"One complete SSI4 Read Cycle at {RATE} — DATA shifted by the clock itself",
 }[MODE]
 KEY = {
  "falling": "clock rising edges — one per bit; DATA should change on these and changes half a period early instead",
  "rising":  "clock rising edges — one per bit; DATA now changes on these, 8 ns after, as 5.4.1 note 2 requires",
- "timer":   "clock rising edges — one per bit; each bit is written at its rising edge and stays valid across the falling edge, where the controller samples",
+ "timer":   "clock rising edges — one per bit; each bit is written 56 ns after its rising edge and stays valid across the falling edge, where the controller samples",
 }[MODE]
 bits=[val(t + (T*0.75 if RISING else T*0.25), 1) for t in c]
 raw=0
@@ -87,7 +88,13 @@ s.append(f'<text x="{PAD}" y="{Y-24}" class="sub">32 clocks · T = {T*1e9:.0f} n
 def band(i0,i1,label,fill):
     x0=X(c[i0]); x1=X(c[i1]+T) if i1==len(c)-1 else X(c[i1+1])
     s.append(f'<rect x="{x0:.1f}" y="{Y-14}" width="{x1-x0:.1f}" height="15" fill="{fill}"/>')
-    s.append(f'<text x="{(x0+x1)/2:.1f}" y="{Y-3}" class="fld" text-anchor="middle">{label}</text>')
+    # Only label a band wide enough to hold the text; at 2 MHz the whole message
+    # is compressed and the labels would overlap into an unreadable smear.
+    short = label.split(" \u2014 ")[0]
+    room  = (x1 - x0) / 5.6           # ~5.6 px per character at 9.5px
+    text  = label if len(label) <= room else (short if len(short) <= room else "")
+    if text:
+        s.append(f'<text x="{(x0+x1)/2:.1f}" y="{Y-3}" class="fld" text-anchor="middle">{text}</text>')
 band(0,0,"PV","#bfdbfe"); band(1,1,"ZPD","#bbf7d0")
 band(2,20,"PD[18:0] — position, 19 bits","#fde68a")
 band(21,31,"TS[10:0] — time stamp, 10 us steps","#fbcfe8")

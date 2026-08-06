@@ -63,11 +63,14 @@ edge and has the late Error Flag.
 
 Both clock taps (PB3 and PC6) must come off the **same** point -- the receiving
 MAX490's RO output. Tapping PC6 upstream of the transceivers makes TIM8 see the
-clock 89 ns early, and every bit is then shifted that much
-before its rising edge. The `skew` command measures the propagation delay to
-each tap and prints the difference; it is the explanation for the -72 ns that
-was open for a while, which decomposed as 89 ns of wiring skew against 17 ns of
-real DMA latency.
+clock early, and every bit is then shifted before its rising edge instead of
+after it. The `skew` command measures the propagation delay to each tap and
+prints the difference. Wired correctly, DATA lands **+56 ns after** its rising
+edge -- that is DMA latency, and it is 2.8% of a bit period at 500 kHz and 22%
+at 2 MHz. That was the explanation for the -72 ns which was open for a while:
+128 ns of wiring skew against 56 ns of DMA latency. Note `skew` under-reports
+when one path is fast, because its polling loop cannot resolve a delay shorter
+than its own overhead -- it said 89 ns where the real figure was 128 ns.
 
 2 MHz is no longer a corner case: with no handover there is no deadline, and it
 measures like any other rate (197/197, Tmu 19.56 us, 0 glitches).

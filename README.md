@@ -423,7 +423,7 @@ wire and because the comparison is what established what "correct" costs.
 |---|---|---|---|
 | Built by | (nothing) | `-DSIMENC_TIMER_DATA=OFF` | + `RISING_EDGE`, `CLOCK_COUNTER` |
 | Bits shifted by | TIM8 + DMA → `BSRR` | SPI1 slave | SPI1 slave |
-| DATA changes on | rising edge, +17 ns¹ | **falling edge** | rising edge, +8 ns |
+| DATA changes on | rising edge, +56 ns | **falling edge** | rising edge, +8 ns |
 | DATA quiet between F1 and R1 | yes, 0/198 | yes | **no — 198/198 disturbed** |
 | Error Flag | **hardware, at the last falling edge** | ISR, 0.83 µs late | ISR, 0.83 µs late |
 | Gap opens with a spurious pulse | **no, 0/197** | yes, ~half of cycles | yes, ~half of cycles |
@@ -432,10 +432,6 @@ wire and because the comparison is what established what "correct" costs.
 | Extra wiring | clock also on PC6 | none | clock also on PD2 |
 
 All three serve every rate from 100 kHz to 2 MHz with `resyncs=0`.
-
-¹ measured as −72 ns on the bench, of which 89 ns is skew from tapping the
-second clock connection upstream of the MAX490 pair rather than at the receiver
-output. See the `SIMENC_TIMER_DATA` section.
 
 ### The SPI fallback drives DATA half a period early
 
@@ -520,7 +516,7 @@ Measured on the analyser at 500 kHz, 198 cycles:
 | Clocks per cycle | 32 on every cycle |
 | **DATA moves between F1 and R1** | **0 / 198** |
 | Payload sampled at the falling edge | **198 / 198 correct** |
-| DATA vs nearest rising edge | −72 ns median — **89 ns of it is a bench wiring skew, see below** |
+| DATA vs nearest rising edge | **+56 ns median**, 3720/3720 after the edge |
 | Tmu | 20.30 µs mean (20.28–20.34) |
 | Gap level | LOW ×200 |
 | **Gaps opening with a spurious HIGH pulse** | **0 / 197** |
@@ -535,41 +531,35 @@ what kept SSI7 (n=30) and SSI8 (n=18) out.
 
 It needs the clock on **PC6** (`TIM8_CH1`, AF3 — morpho CN10-4) as well as PB3.
 
-**About the −72 ns: it is wiring skew, not the data path.** Each bit appeared to
+**Both clock taps must come off the same point.** For a while DATA appeared to
 be written 72 ns *before* its rising edge, which no clock event can explain and
-DMA latency could only make worse. The `skew` console command measures the
-propagation delay from the master's clock output to each tap, timing both the
-same way so the polling overhead is common-mode:
+which DMA latency could only make worse. It was the wiring: PC6 had been tapped
+upstream of the two MAX490s while PB3 received the clock through them, so TIM8
+was triggered by an early copy of the clock. The `skew` command measures the
+propagation delay to each tap, timing both the same way so the polling overhead
+is common-mode:
 
-```
-clock tap delay: PB3 177ns  PC6 88ns  skew -89 ns
-```
+| PC6 tapped | `skew` reports | DATA vs rising edge | after the edge |
+|---|---|---|---|
+| upstream of the transceivers | −89 ns | −72 ns | 0 / 3737 |
+| **at the receiver output (correct)** | **0 ns** | **+56 ns** | **3720 / 3720** |
 
-PC6 sees the clock **89 ns before PB3**, reproducibly. That closes the
-arithmetic:
+With both taps on the same net every bit lands **+56 ns after** its rising edge,
+which is DMA latency and is the direction the specification asks for: 2.8 % of a
+bit period at 500 kHz, 22 % at 2 MHz, so the bit is settled long before the
+controller samples it on the following falling edge.
 
-```
-DATA written at  PC6 edge + DMA latency
-               = (PB3 edge − 89 ns) + 17 ns
-               = PB3 edge − 72 ns          ← what the analyser measured
-```
+On real hardware this is automatic — there is one receiver and both pins hang
+off its output. It only arises on a bench with a jumper.
 
-So the DMA is late by 17 ns, exactly as it should be, and the clock feeding it
-is early. The cause is where the second tap is connected: on the bench it was
-picked up on the **master side, upstream of the two MAX490s**, and 89 ns is
-their propagation delay. PB3 receives the clock through the transceivers; PC6
-bypassed them.
-
-**Tap PC6 from the same point as PB3** — the receiving MAX490's `RO` output, i.e.
-CN10-31 on the bench, not the master's CN10-25. Then the skew is nil and each
-bit lands ~17 ns *after* its rising edge, which is what the specification asks
-for. On real hardware this is automatic: there is one receiver, and both pins
-hang off its output.
-
-The analyser's clock channel tracks PB3, which is what makes the measurement
-meaningful — confirmed independently, since the SPI fallback (clocked by PB3)
-puts DATA 8 ns after the falling edge, impossible if the probe sat on the master
-side.
+Two notes on the measurement. `skew` reports a *lower bound* when one path is
+fast: its polling loop cannot resolve a delay shorter than its own overhead, so
+the fast tap bottoms out. Correcting the wiring moved the edge by 128 ns while
+`skew` had reported 89 ns, and 128 ns is the real skew — consistent with the
++56 ns now measured, since −128 + 56 = −72. And the analyser's clock channel
+tracks PB3, which is what makes any of this meaningful: confirmed independently,
+since the SPI fallback is clocked by PB3 and puts DATA 8 ns after the falling
+edge, impossible if the probe sat on the master side.
 
 Three hardware facts cost a probe cycle each and are recorded in `board.h` so
 they are not retried:
@@ -678,11 +668,12 @@ measures like any other rate.
 | | 500 kHz | 2 MHz |
 |---|---|---|
 | Clocks per cycle | 32 on every one | 32 on every one |
-| Clock rate | 0.5001 MHz | 2.0007 MHz |
 | Payload | 197/197 | 197/197 |
+| DATA after its rising edge | +56 ns, 3720/3720 | +56 ns, 3740/3740 |
+| — as a fraction of the half period | 2.8 % | 22 % |
 | DATA moves between F1 and R1 | 0 | 0 |
 | Gaps opening with a HIGH pulse | 0 | 0 |
-| Tmu (spec 20 µs ± 1) | 20.30 µs | 19.56 µs |
+| Tmu (spec 20 µs ± 1) | 20.43 µs | 19.66 µs |
 
 Both land inside the Tmu window from the same dynamic correction, which is the
 point of measuring `T` per frame rather than assuming it: the half-period term
@@ -867,8 +858,8 @@ at a time, and the timer engine restores the pin afterwards.
   at the last falling edge.
 - **Both clock taps must come off the same point** — the receiving MAX490's
   output. Tapping PC6 upstream of the transceivers makes TIM8 see the clock
-  89 ns early, and every data bit is then shifted out that much before its
-  rising edge. `skew` measures it.
+  early, and every data bit is then shifted out before its rising edge instead
+  of after it. `skew` measures the difference.
 - `ssi_slave` supports byte-aligned frame lengths only (n = 8/16/24/32) *in the
   default build*, so SSI1, SSI2, SSI4, SSI6 and SSI9 are implemented and SSI7
   (n=30) and SSI8 (n=18) are not. `SIMENC_CLOCK_COUNTER` and
