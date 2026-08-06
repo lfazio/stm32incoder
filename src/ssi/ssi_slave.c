@@ -73,12 +73,15 @@
 #if defined(SIMENC_TIMER_DATA)
 /* The DATA stream is 4, whose flags live in the HIGH interrupt registers --
  * unlike the SPI streams above, which are 2 and 3 and use the LOW ones. */
-#define SSI_DATA_CLEAR_FLAGS (DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | \
-                              DMA_LIFCR_CTEIF2 | DMA_LIFCR_CDMEIF2 | \
-                              DMA_LIFCR_CFEIF2)
+/* DMA2 stream 3: flags live in the LOW interrupt registers. */
+#define SSI_DATA_CLEAR_FLAGS (DMA_LIFCR_CTCIF3 | DMA_LIFCR_CHTIF3 | \
+                              DMA_LIFCR_CTEIF3 | DMA_LIFCR_CDMEIF3 | \
+                              DMA_LIFCR_CFEIF3)
 #endif
 
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_TIMER_DATA)
+#define CLK_TIM         SSI_CLKIN_TIM      /* TIM8: APB2, so DMA2 reaches GPIO */
+#elif defined(SIMENC_CLOCK_COUNTER)
 #define CLK_TIM         SSI_ETR_TIM
 #define CLK_TIM_IRQn    SSI_ETR_TIM_IRQn
 #endif
@@ -138,7 +141,7 @@ static volatile uint32_t     s_moder_af;
  * before transfer-complete, and both run in non-critical handlers, so the two
  * cycle counts give T for free:  T = (t_TC - t_HT) / (n_bits/2).
  */
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
 /* Sticky: the counter has actually reached n and ended a message. Set from the
  * update handler, which is the only thing that proves it -- an earlier version
  * polled CNT != 0 instead and was wrong in both directions. It read "counting"
@@ -221,7 +224,7 @@ static void stage_frame(void)
 
 static inline void spi_configure(void);
 static inline void spi_reset(void);
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
 static inline void clock_counter_arm(void);
 #endif
 
@@ -246,12 +249,12 @@ static void ssi_arm(void)
      * watchdog seeing an idle count and nothing to resync. Mask UDE first, and
      * unmask only once the stream is loaded and enabled. */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-    CLK_TIM->DIER &= ~TIM_DIER_UDE;
+    CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
     CLK_TIM->SR    = 0;
 
     SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
     while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
-    DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
+    DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
 
     SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
     SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
@@ -261,7 +264,7 @@ static void ssi_arm(void)
      * rising edge overwrites it with D(n-1). */
     CLK_TIM->CNT   = 0;
     CLK_TIM->SR    = 0;
-    CLK_TIM->DIER |= TIM_DIER_UDE;
+    CLK_TIM->DIER |= TIM_DIER_CC2DE;
     CLK_TIM->CR1  |= TIM_CR1_CEN;
     s_armed = true;
 }
@@ -468,9 +471,13 @@ static void dma_init(void)
 }
 #endif /* !SIMENC_TIMER_DATA */
 
-#if defined(SIMENC_CLOCK_COUNTER)
-/* TIM3 counting SSI clock edges on ETR, so that end of message is the nth
- * edge on the wire rather than the nth byte through the SPI. */
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
+/* Counts SSI clock edges off the wire. Two shapes, selected by build:
+ *   SIMENC_CLOCK_COUNTER  TIM3 on ETR, one count per rising edge, ARR = n-1,
+ *                         so the update event is end of message.
+ *   SIMENC_TIMER_DATA     TIM8 on TI1F_ED, one count per *edge*, ARR = 1, and
+ *                         a channel-2 compare that lands on every rising edge
+ *                         to drive the DATA DMA. */
 static void clock_counter_init(void)
 {
     GPIO_InitTypeDef io = {0};
@@ -496,7 +503,11 @@ static void clock_counter_init(void)
     HAL_GPIO_Init(SSI_ETR_GPIO, &io);
 #endif
 
+#if defined(SIMENC_TIMER_DATA)
+    __HAL_RCC_TIM8_CLK_ENABLE();
+#else
     __HAL_RCC_TIM3_CLK_ENABLE();
+#endif
 
     CLK_TIM->CR1 = 0;
     CLK_TIM->PSC = 0;                      /* count every edge, not every Nth */
@@ -518,7 +529,13 @@ static void clock_counter_init(void)
      * edge detector: it pulses on *both* edges of TI1, so the counter advances
      * at twice the bit rate. CC1S=01 maps the pin to IC1 so the detector sees
      * it; the capture value itself is never read, only the edges matter. */
+    /* Channel 1 is the input the counter is clocked from; channel 2 is an
+     * output compare left frozen (OC2M=000), used only for the event it raises.
+     * CCR2=0 matches when the counter wraps 1 -> 0, which is the rising edge --
+     * the same instant as the update event, but a compare event repeats where
+     * the update event was measured to fire exactly once. */
     CLK_TIM->CCMR1 = TIM_CCMR1_CC1S_0;
+    CLK_TIM->CCR2  = 0u;
     CLK_TIM->SMCR  = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
                    | TIM_SMCR_TS_2;
 #else
@@ -533,7 +550,7 @@ static void clock_counter_init(void)
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
 #if defined(SIMENC_TIMER_DATA)
-    CLK_TIM->DIER = TIM_DIER_UDE;          /* one DMA request per rising edge */
+    CLK_TIM->DIER = TIM_DIER_CC2DE;        /* one DMA request per rising edge */
 #else
     CLK_TIM->DIER = TIM_DIER_UIE;
 #endif
@@ -558,7 +575,7 @@ static inline void clock_counter_arm(void)
     CLK_TIM->SR   = 0;
     CLK_TIM->CR1 |= TIM_CR1_CEN;
 }
-#endif /* SIMENC_CLOCK_COUNTER */
+#endif /* SIMENC_CLOCK_COUNTER || SIMENC_TIMER_DATA */
 
 #if defined(SIMENC_TIMER_DATA)
 SSI_RAMFUNC static void gap_timer_start(void);
@@ -567,7 +584,7 @@ SSI_RAMFUNC static void gap_timer_start(void);
  * peripheral, one 32-bit word per clock edge into GPIOB->BSRR. */
 static void data_dma_init(void)
 {
-    __HAL_RCC_DMA1_CLK_ENABLE();
+    __HAL_RCC_DMA2_CLK_ENABLE();
 
     SSI_DATA_DMA_STREAM->CR = 0;
     while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
@@ -587,24 +604,24 @@ static void data_dma_init(void)
 
 /* End of message: the DMA has written all n bits, so the last rising edge has
  * just happened. 5.4.1 note 3 puts the Error Flag here. */
-void DMA1_Stream2_IRQHandler(void)
+void DMA2_Stream3_IRQHandler(void)
 {
-    if (DMA1->LISR & DMA_LISR_TCIF2) {
+    if (DMA2->LISR & DMA_LISR_TCIF3) {
         /* Stop the request source in the same breath as ending the message, so
          * nothing can be raised during the gap that survives into the re-arm. */
         CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-        CLK_TIM->DIER &= ~TIM_DIER_UDE;
+        CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
 
         data_drive(s_gap_level);
 
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-        DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
+        DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
         s_armed = false;
         s_frames++;
         s_clk_counted = true;
         gap_timer_start();
     } else {
-        DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
+        DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
     }
 }
 #endif /* SIMENC_TIMER_DATA */
@@ -674,7 +691,7 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     spi_init();
     dma_init();
 #endif
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
     clock_counter_init();
 #endif
     gap_timer_init();
@@ -703,7 +720,11 @@ bool ssi_slave_set_frame_bits(uint8_t n_bits)
 
     s_cfg.n_bits = n_bits;
     s_nbytes     = (uint8_t)(n_bits / 8u);
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) && !defined(SIMENC_TIMER_DATA)
+    /* Only the counting build ties ARR to the frame length. The timer-data
+     * build keeps ARR=1 whatever n is -- it counts two edges per bit, not n
+     * edges per message -- and rewriting it here broke every variant switch:
+     * one `ssi` command left ARR at n-1 and the path never recovered. */
     CLK_TIM->CR1 &= ~TIM_CR1_CEN;
     CLK_TIM->ARR  = (uint32_t)n_bits - 1u;
     CLK_TIM->EGR  = TIM_EGR_UG;
@@ -871,7 +892,7 @@ void TIM3_IRQHandler(void)
 
 #endif /* SIMENC_CLOCK_COUNTER && !SIMENC_TIMER_DATA */
 
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
 /* Lives outside the handler guard above: with SIMENC_TIMER_DATA the DMA ends
  * the message and TIM3 raises no interrupt at all, but the question this
  * answers -- did the ETR wire ever carry a full message -- is the same. */

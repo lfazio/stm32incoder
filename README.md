@@ -334,6 +334,9 @@ payload consistently — `pd=447186` at 500 kHz and 1 MHz, `485737` at 2 MHz,
 self-consistently, which is why the counts still read 198/198. The analyser is
 the authority here, and it says the wire is right.
 
+**Superseded by the timer/DMA data path** (`-DSIMENC_TIMER_DATA=ON`), which
+fixes the first-bit-period defect below by construction. Keep reading.
+
 **Not correct in the first bit period, though.** Nothing may touch DATA between
 the first falling edge and the first rising edge — the line must simply hold
 what it had. Measured over 198 cycles:
@@ -361,6 +364,49 @@ is silent without having to arrange anything.
 
 Not fixed by this either: the Error Flag is still driven from an ISR and still
 arrives ~0.83 µs late.
+
+### The timer/DMA data path — DATA driven by the clock itself
+
+`-DSIMENC_TIMER_DATA=ON` drops SPI1 entirely. TIM8 is clocked by `TI1F_ED`, the
+channel-1 edge detector, which counts **both** clock edges; with `ARR=1` the
+counter wraps every second edge, and because the clock idles HIGH the edges pair
+up as (F1,R1), (F2,R2)... so the wrap always lands on a rising edge. A frozen
+channel-2 compare with `CCR2=0` matches at that wrap and raises one DMA request,
+which writes the next bit to `GPIOB->BSRR`.
+
+Measured on the analyser at 500 kHz, 198 cycles:
+
+| | result |
+|---|---|
+| Clocks per cycle | 32 on every cycle |
+| **DATA moves between F1 and R1** | **0 / 198** |
+| Payload sampled at the falling edge | **198 / 198 correct** |
+| DATA vs nearest rising edge | −72 ns median (−80…−16) |
+
+The first-bit-period defect is gone, and it is gone structurally rather than by
+arrangement: PB4 stays a GPIO output for the whole cycle, only the *writer*
+changes, and no compare event exists between F1 and R1 so nothing can write
+there. `EXTI3_IRQHandler` does not exist in this build at all, and with it goes
+the 250 ns deadline and its 26 ns margin.
+
+On the bench: 198/198 at 100 kHz, 500 kHz, 1 MHz and 2 MHz, `resyncs=0`. The
+test master reads `pd=447186` because it samples on the rising edge while the
+slave now drives there — the same self-consistent shift as the SPI rising-edge
+build. For the same reason `ssi2` and `ssi6` report failures in loopback and
+`ssi1`, `ssi4`, `ssi9` do not: those two are the only variants carrying an
+integrity check (parity, CRC-8), and a one-bit shift breaks a checksum where it
+merely relabels a plain position field.
+
+**Unexplained: the −72 ns.** Each bit is written slightly *before* its rising
+edge, not just after it, and tightly so (p25 = p50 = p75 = −72 ns). No clock
+event sits there, and DMA latency could only make it late. It is harmless for a
+controller sampling on the falling edge — the bit is valid across that edge,
+which is why the payload decodes 198/198 — but it is not understood, and 72 ns
+is 3.6 % of a bit period at 500 kHz against 14 % at 2 MHz. Understand it before
+making this the default.
+
+Still not fixed here: the Error Flag is driven from the DMA's transfer-complete
+interrupt, so it keeps its ~0.83 µs lateness.
 
 ### The original deviation — DATA changes on the falling edge (shipping default)
 

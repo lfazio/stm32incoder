@@ -94,21 +94,34 @@
  * once because nothing clears TIF. The update event is the one pattern that
  * repeats -- the same one the test master's clock generator uses.
  *
- * TIM3_UP -> DMA1 Stream 2, Channel 5 [RM0390 Rev 9 Table 28], sharing that
- * cell with TIM3_CH4. USART2_TX for the trace is Stream 6 Channel 4, so there
- * is no conflict.
+ * The request comes from a compare event, not the update event: measured on
+ * hardware, the update event with UDE moves exactly one word and then stops,
+ * while compare events repeat -- which is what the test master's own clock
+ * generator has always relied on. Channel 1 is occupied being the clock input,
+ * so channel 2 does the compare, with CCR2=0 so it matches when the counter
+ * wraps to 0, which is the rising edge.
  *
- * TI1F_ED is a channel-1 input, not ETR, so the clock has to reach TIM3_CH1:
- * PC6 on AF2 [DS Table 11], morpho CN10 pin 4 -- the same connector the clock
- * already comes out on at CN10-31.
+ * It must be **TIM8 and DMA2**, not TIM3 and DMA1. GPIO lives on AHB1 and DMA1
+ * cannot reach it: driving GPIOB->BSRR from DMA1 raises a transfer error on the
+ * first word and the hardware disables the stream (measured: TEIF set, one
+ * transfer, stream off). DMA2 is the one that can, which is why the test master
+ * -- TIM1 on APB2, so DMA2 -- has always worked. TIM8 is the free APB2 timer.
+ *
+ * TIM8_CH2 -> DMA2 Stream 3, Channel 7 [RM0390 Rev 9 Table 29]. In this build
+ * there is no SPI1, so streams 2 and 3 are free; ADC1 keeps stream 0.
+ *
+ * TI1F_ED is a channel-1 input, so the clock reaches TIM8_CH1 = PC6 on **AF3**
+ * [DS Table 11], morpho CN10 pin 4. The same pad also carries TIM3_CH1 on AF2,
+ * so this is a change of alternate function only -- the wire does not move.
  */
 #define SSI_CLKIN_GPIO           GPIOC
 #define SSI_CLKIN_PIN            GPIO_PIN_6
-#define SSI_CLKIN_AF             GPIO_AF2_TIM3
+#define SSI_CLKIN_AF             GPIO_AF3_TIM8
+#define SSI_CLKIN_TIM            TIM8
 
-#define SSI_DATA_DMA_STREAM      DMA1_Stream2
-#define SSI_DATA_DMA_CHANNEL     5u
-#define SSI_DATA_DMA_IRQn        DMA1_Stream2_IRQn
+#define SSI_DATA_DMA_STREAM      DMA2_Stream3
+#define SSI_DATA_DMA_CHANNEL     7u
+#define SSI_DATA_DMA_IRQn        DMA2_Stream3_IRQn
 #define SSI_DATA_BSRR            (&GPIOB->BSRR)
 
 #define SSI_MASTER_SPI           SPI2

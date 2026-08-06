@@ -70,7 +70,7 @@ void ssi_slave_poll(void);
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out);
 
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
 /* True once the external clock counter has actually reached n and ended a
  * message. It counts the clock on a second pad (TIM3_ETR, PD2 / CN7-4), and if
  * that wire is missing the counter never reaches n, no message ever ends and
