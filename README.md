@@ -334,7 +334,32 @@ payload consistently — `pd=447186` at 500 kHz and 1 MHz, `485737` at 2 MHz,
 self-consistently, which is why the counts still read 198/198. The analyser is
 the authority here, and it says the wire is right.
 
-Not yet fixed by this: the Error Flag is still driven from an ISR and still
+**Not correct in the first bit period, though.** Nothing may touch DATA between
+the first falling edge and the first rising edge — the line must simply hold
+what it had. Measured over 198 cycles:
+
+| Build | DATA moves between F1 and R1 | when |
+|---|---|---|
+| Shipping @ 500 kHz | 0 / 198 | — |
+| `SIMENC_RISING_EDGE` @ 500 kHz | **198 / 198** | 288–312 ns after F1 |
+| `SIMENC_RISING_EDGE` @ 2 MHz | 0 / 198 | — |
+
+The cause is the EXTI3 handover itself. PB4 is held HIGH by GPIO through the
+gap; at F1 the handler flips it to alternate function and enables `SPE`, and
+the SPI then drives the line ~300 ns later, at a moment unrelated to R1.
+
+The 2 MHz row is the same fault in disguise, not a pass: there the half period
+is 250 ns, so the same ~300 ns delay lands *past* R1 and shows up instead as the
+first bit arriving 88–96 ns after the rising edge. Reading that as handover
+margin is a mistake — it is the same late handover measured from the other side.
+
+This cannot be fixed inside the SPI approach. The pin has to change owner
+somewhere in that window, and wherever it does, the line moves. The timer/DMA
+data path removes it by construction: PB4 stays a GPIO output throughout, only
+the writer changes, and nothing writes BSRR until R1, so the first half period
+is silent without having to arrange anything.
+
+Not fixed by this either: the Error Flag is still driven from an ISR and still
 arrives ~0.83 µs late.
 
 ### The original deviation — DATA changes on the falling edge (shipping default)
