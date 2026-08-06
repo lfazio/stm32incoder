@@ -103,6 +103,10 @@ static ssi_slave_provider_t  s_provider;
 static void                 *s_ctx;
 static uint8_t               s_nbytes;
 
+#if defined(SIMENC_TIMER_DATA)
+/* One BSRR word per message bit. 32 is the longest frame the variants use. */
+static volatile uint32_t     s_bsrr[32];
+#endif
 static volatile uint8_t      s_tx[4];
 static volatile uint8_t      s_rx[4];
 static volatile bool         s_armed;
@@ -181,11 +185,23 @@ static void stage_frame(void)
         s_provider(s_ctx, &f);
     }
 
+#if defined(SIMENC_TIMER_DATA)
+    /* One BSRR word per bit, MSB first. Writing BSRR sets or resets the pin in
+     * a single store with no read-modify-write, so the DMA needs no knowledge
+     * of any other pin in the port -- which is the register-sharing trap that
+     * bit us in EXTI3_IRQHandler, avoided here by construction. */
+    for (uint8_t i = 0; i < s_cfg.n_bits; i++) {
+        uint32_t bit = (f.payload >> (s_cfg.n_bits - 1u - i)) & 1u;
+        s_bsrr[i] = bit ? (uint32_t)SSI_SLAVE_DATA_PIN
+                        : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
+    }
+#else
     /* MSB first: byte 0 carries D(n-1)..D(n-8). */
     for (uint8_t i = 0; i < s_nbytes; i++) {
         uint8_t shift = (uint8_t)(s_cfg.n_bits - 8u * (i + 1u));
         s_tx[i] = (uint8_t)((f.payload >> shift) & 0xFFu);
     }
+#endif
 
     /* Note 3 of section 5.4.1: after the last rising edge the data line is set
      * by the Error Flag. PV is the inverse of the ERROR FLAG, so a valid
@@ -201,6 +217,31 @@ static inline void spi_reset(void);
 static inline void clock_counter_arm(void);
 #endif
 
+#if defined(SIMENC_TIMER_DATA)
+/* Arm one message: the DATA DMA reloads, then the edge counter starts.
+ *
+ * There is no pin handover and no shift register here. PB4 stays a GPIO output
+ * throughout; the only thing that changes is who writes it -- software during
+ * the gap, the DMA during the message. So nothing has to happen at the first
+ * falling edge, which is why this build has no EXTI3 handler and none of its
+ * 250 ns deadline. The first rising edge writes D(n-1) by itself. */
+static void ssi_arm(void)
+{
+    SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+    while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    DMA1->LIFCR = DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
+                  DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+
+    SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
+    SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
+    SSI_DATA_DMA_STREAM->CR  |= DMA_SxCR_EN;
+
+    /* The gap level is already on the pin; leave it there until the first
+     * rising edge overwrites it with D(n-1). */
+    clock_counter_arm();
+    s_armed = true;
+}
+#else
 static void ssi_arm(void)
 {
     SSI_SLAVE_SPI->CR1 &= ~SPI_CR1_SPE;
@@ -261,6 +302,7 @@ static void ssi_arm(void)
     EXTI->IMR |= SSI_SLAVE_SCK_PIN;
     s_armed = true;
 }
+#endif /* SIMENC_TIMER_DATA */
 
 /* --- init ----------------------------------------------------------------- */
 
@@ -363,6 +405,7 @@ static inline void spi_reset(void)
     spi_configure();
 }
 
+#if !defined(SIMENC_TIMER_DATA)
 static void spi_init(void)
 {
     __HAL_RCC_SPI1_CLK_ENABLE();
@@ -399,6 +442,7 @@ static void dma_init(void)
     HAL_NVIC_SetPriority(SSI_RX_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(SSI_RX_IRQn);
 }
+#endif /* !SIMENC_TIMER_DATA */
 
 #if defined(SIMENC_CLOCK_COUNTER)
 /* TIM3 counting SSI clock edges on ETR, so that end of message is the nth
@@ -423,7 +467,15 @@ static void clock_counter_init(void)
 
     CLK_TIM->CR1 = 0;
     CLK_TIM->PSC = 0;                      /* count every edge, not every Nth */
+#if defined(SIMENC_TIMER_DATA)
+    /* ARR=0 so every counted rising edge raises an update event, and every
+     * update event is one DMA request -- one bit onto the bus per rising edge.
+     * End of message is then the DMA's transfer-complete after n of them, so
+     * this timer no longer needs to count to n itself. */
+    CLK_TIM->ARR = 0u;
+#else
     CLK_TIM->ARR = (uint32_t)s_cfg.n_bits - 1u;
+#endif
 
     /* External clock mode 2 (RM0390 17.3.12): ECE=1 clocks the counter from
      * ETRF. ETP=0 counts rising edges, which is where the receive DMA completes
@@ -434,13 +486,19 @@ static void clock_counter_init(void)
 
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
+#if defined(SIMENC_TIMER_DATA)
+    CLK_TIM->DIER = TIM_DIER_UDE;          /* DMA request, no interrupt */
+#else
     CLK_TIM->DIER = TIM_DIER_UIE;
+#endif
 
     /* Same priority as the receive DMA's end-of-message interrupt it replaces:
      * above everything except the EXTI3 handover, which it must never preempt
      * -- equal preemption priority, higher subpriority. */
+#if !defined(SIMENC_TIMER_DATA)
     HAL_NVIC_SetPriority(CLK_TIM_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(CLK_TIM_IRQn);
+#endif
 }
 
 /* Restarts the count for one message. The counter must be zeroed rather than
@@ -455,6 +513,51 @@ static inline void clock_counter_arm(void)
     CLK_TIM->CR1 |= TIM_CR1_CEN;
 }
 #endif /* SIMENC_CLOCK_COUNTER */
+
+#if defined(SIMENC_TIMER_DATA)
+SSI_RAMFUNC static void gap_timer_start(void);
+
+/* DMA1 Stream 2 Channel 5 = TIM3_UP [RM0390 Rev 9 Table 28], memory to
+ * peripheral, one 32-bit word per clock edge into GPIOB->BSRR. */
+static void data_dma_init(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    SSI_DATA_DMA_STREAM->CR = 0;
+    while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    SSI_DATA_DMA_STREAM->PAR = (uint32_t)(uintptr_t)SSI_DATA_BSRR;
+    SSI_DATA_DMA_STREAM->CR  = (SSI_DATA_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
+                             | DMA_SxCR_DIR_0            /* memory -> periph */
+                             | DMA_SxCR_MINC
+                             | DMA_SxCR_PSIZE_1          /* 32-bit */
+                             | DMA_SxCR_MSIZE_1
+                             | DMA_SxCR_PL_0 | DMA_SxCR_PL_1  /* very high */
+                             | DMA_SxCR_TCIE;            /* end of message */
+    SSI_DATA_DMA_STREAM->FCR = 0;
+
+    HAL_NVIC_SetPriority(SSI_DATA_DMA_IRQn, 0, 1);
+    HAL_NVIC_EnableIRQ(SSI_DATA_DMA_IRQn);
+}
+
+/* End of message: the DMA has written all n bits, so the last rising edge has
+ * just happened. 5.4.1 note 3 puts the Error Flag here. */
+void DMA1_Stream2_IRQHandler(void)
+{
+    if (DMA1->LISR & DMA_LISR_TCIF2) {
+        DMA1->LIFCR = DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
+                      DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+        data_drive(s_gap_level);
+        SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+        s_armed = false;
+        s_frames++;
+        s_clk_counted = true;
+        gap_timer_start();
+    } else {
+        DMA1->LIFCR = DMA_LIFCR_CHTIF2 | DMA_LIFCR_CTEIF2 |
+                      DMA_LIFCR_CDMEIF2 | DMA_LIFCR_CFEIF2;
+    }
+}
+#endif /* SIMENC_TIMER_DATA */
 
 static void gap_timer_init(void)
 {
@@ -515,8 +618,12 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     s_period_valid = false;
 
     gpio_init();
+#if defined(SIMENC_TIMER_DATA)
+    data_dma_init();      /* replaces the SPI shift register entirely */
+#else
     spi_init();
     dma_init();
+#endif
 #if defined(SIMENC_CLOCK_COUNTER)
     clock_counter_init();
 #endif
@@ -567,9 +674,15 @@ void ssi_slave_poll(void)
      * through a message in at most n x 10 us. Anything else means the master
      * stopped clocking mid-message, which would leave the byte framing skewed
      * for every later cycle -- so drop it and re-arm. */
+#if defined(SIMENC_TIMER_DATA)
+    uint16_t ndtr = (uint16_t)SSI_DATA_DMA_STREAM->NDTR;
+    const uint16_t idle_ndtr = s_cfg.n_bits;
+#else
     uint16_t ndtr = (uint16_t)SSI_RX_STREAM->NDTR;
+    const uint16_t idle_ndtr = s_nbytes;
+#endif
 
-    if (ndtr != s_nbytes && ndtr == s_last_ndtr) {
+    if (ndtr != idle_ndtr && ndtr == s_last_ndtr) {
         s_resyncs++;
         data_drive(true);
         data_take_gpio();
@@ -596,6 +709,7 @@ void ssi_slave_get_stats(ssi_slave_stats_t *out)
  *
  * The interrupt is masked here and re-armed by ssi_arm(), so it costs exactly
  * one interrupt per message rather than one per clock. */
+#if !defined(SIMENC_TIMER_DATA)
 SSI_RAMFUNC void EXTI3_IRQHandler(void)
 {
     /* Read-modify-write only this pin's two MODER bits. Storing a whole
@@ -618,10 +732,12 @@ SSI_RAMFUNC void EXTI3_IRQHandler(void)
     EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
     EXTI->PR   = SSI_SLAVE_SCK_PIN;
 }
+#endif /* !SIMENC_TIMER_DATA */
 
 /* End of message, whichever detector saw it: all n clocks have been counted.
  * Both callers run at the same instant -- the last rising edge -- so the gap
  * correction below is the same either way. */
+#if !defined(SIMENC_TIMER_DATA)
 static void end_of_message(void)
 {
     /* Read the cycle counter before anything else, in particular before the
@@ -689,8 +805,9 @@ void DMA2_Stream2_IRQHandler(void)
         DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;
     }
 }
+#endif /* !SIMENC_TIMER_DATA */
 
-#if defined(SIMENC_CLOCK_COUNTER)
+#if defined(SIMENC_CLOCK_COUNTER) && !defined(SIMENC_TIMER_DATA)
 /* End of message: TIM3 has counted the nth clock edge on the wire. */
 void TIM3_IRQHandler(void)
 {
@@ -702,6 +819,12 @@ void TIM3_IRQHandler(void)
     }
 }
 
+#endif /* SIMENC_CLOCK_COUNTER && !SIMENC_TIMER_DATA */
+
+#if defined(SIMENC_CLOCK_COUNTER)
+/* Lives outside the handler guard above: with SIMENC_TIMER_DATA the DMA ends
+ * the message and TIM3 raises no interrupt at all, but the question this
+ * answers -- did the ETR wire ever carry a full message -- is the same. */
 bool ssi_slave_clock_counter_ok(void)
 {
     return s_clk_counted;

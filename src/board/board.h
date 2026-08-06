@@ -70,6 +70,23 @@
 #define SSI_ETR_PIN              GPIO_PIN_2
 #define SSI_ETR_AF               GPIO_AF2_TIM3
 
+/* DATA shifted out by DMA, clocked by the SSI clock itself.
+ *
+ * TIM3 counts clock rising edges on ETR with ARR=0, so it raises an update
+ * event on every one, and TIM3_UP drives a DMA that writes the next bit to
+ * GPIOB->BSRR. Each rising edge therefore shifts one bit onto the bus, which
+ * is what 5.4.1 note 2 describes, and the bit is then valid across the falling
+ * edge where the controller samples it.
+ *
+ * TIM3_UP -> DMA1 Stream 2, Channel 5 [RM0390 Rev 9 Table 28]. Stream 2 shares
+ * that cell with TIM3_CH4, which is unused here. USART2_TX for the trace is
+ * Stream 6 Channel 4, so there is no conflict.
+ */
+#define SSI_DATA_DMA_STREAM      DMA1_Stream2
+#define SSI_DATA_DMA_CHANNEL     5u
+#define SSI_DATA_DMA_IRQn        DMA1_Stream2_IRQn
+#define SSI_DATA_BSRR            (&GPIOB->BSRR)
+
 #define SSI_MASTER_SPI           SPI2
 #define SSI_MASTER_SCK_GPIO      GPIOB
 #define SSI_MASTER_SCK_PIN       GPIO_PIN_10
