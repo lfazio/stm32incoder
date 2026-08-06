@@ -140,6 +140,7 @@ static void cmd_help(void)
     trace_printf("  ssi 1|2|4|6|9        payload variant; 4 is the default\r\n");
     trace_printf("test master (loopback only):\r\n");
     trace_printf("  wire                 check the loopback jumpers for continuity\r\n");
+    trace_printf("  skew                 clock propagation delay to PB3 vs PC6\r\n");
     trace_printf("  clk <hz>             clock rate, any value 100k..2M (timer)\r\n");
     trace_printf("  read [n]             n Read Cycles, decode each\r\n");
     trace_printf("  burst [n] [gapus]    n cycles, no tracing between; for capture\r\n");
@@ -341,6 +342,13 @@ static void handle_line(char *line)
         trace_printf("master clock = %lu Hz (timer, %+ld.%ld%%)  spi fallback %lu Hz\r\n",
                      (unsigned long)got, err_ppt / 10, (err_ppt < 0 ? -err_ppt : err_ppt) % 10,
                      (unsigned long)spi);
+    } else if (strcmp(cmd, "skew") == 0) {
+        uint32_t pb3 = 0, pc6 = 0;
+        ssi_clock_skew(&pb3, &pc6);
+        trace_printf("clock tap delay: PB3 %luns  PC6 %luns  skew %ld ns\r\n",
+                     (unsigned long)pb3, (unsigned long)pc6,
+                     (long)pc6 - (long)pb3);
+        ssi_slave_start();
     } else if (strcmp(cmd, "wire") == 0) {
         bool ck = false;
         bool dt = false;

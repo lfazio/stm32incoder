@@ -68,4 +68,13 @@ void ssi_master_timer_debug(uint32_t *out7);
  * re-armed with ssi_slave_start() afterwards. */
 bool ssi_loopback_check(bool *clock_ok, bool *data_ok);
 
+/* Propagation delay from the master's clock output to each of the two places
+ * the clock is consumed: PB3 (the SPI/EXTI input) and PC6 (TIM8's input, which
+ * shifts DATA in the default build). Both are timed the same way with the DWT
+ * cycle counter, so the polling overhead is common-mode and the *difference*
+ * between them is the meaningful number -- it is the skew between the two taps,
+ * which shows up directly as DATA landing early or late against the clock a
+ * logic analyser sees. Returns nanoseconds. */
+void ssi_clock_skew(uint32_t *pb3_ns, uint32_t *pc6_ns);
+
 #endif /* SIMENC_SSI_MASTER_H */

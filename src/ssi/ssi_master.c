@@ -287,6 +287,61 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     return true;
 }
 
+/* Time PB10 -> pin, in DWT cycles, as the median of several tries. Each try
+ * drives the clock pin low, settles, then drives it high and spins on IDR. */
+static uint32_t edge_delay_cycles(volatile uint32_t *idr, uint32_t mask)
+{
+    uint32_t best[9];
+
+    for (uint32_t k = 0; k < 9u; k++) {
+        GPIOB->BSRR = (uint32_t)SSI_MASTER_SCK_PIN << 16u;
+        ssi_master_delay_us(20);
+
+        uint32_t t0 = DWT->CYCCNT;
+        GPIOB->BSRR = SSI_MASTER_SCK_PIN;
+        uint32_t guard = 0;
+        while (((*idr) & mask) == 0u && guard < 4000u) {
+            guard++;
+        }
+        best[k] = DWT->CYCCNT - t0;
+    }
+    /* median of 9, by selection -- no sorting library and none needed */
+    for (uint32_t i = 0; i < 5u; i++) {
+        uint32_t m = i;
+        for (uint32_t j = i + 1u; j < 9u; j++) {
+            if (best[j] < best[m]) { m = j; }
+        }
+        uint32_t t = best[i]; best[i] = best[m]; best[m] = t;
+    }
+    return best[4];
+}
+
+void ssi_clock_skew(uint32_t *pb3_ns, uint32_t *pc6_ns)
+{
+    EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
+    EXTI->PR   = SSI_SLAVE_SCK_PIN;
+
+    uint32_t moder_save = GPIOB->MODER;
+    uint32_t odr_save   = GPIOB->ODR;
+
+    uint32_t m = moder_save & ~(3u << (10u * 2u));
+    m |= (1u << (10u * 2u));                 /* PB10 push-pull output */
+    GPIOB->MODER = m;
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    uint32_t c_pb3 = edge_delay_cycles(&GPIOB->IDR, SSI_SLAVE_SCK_PIN);
+    uint32_t c_pc6 = edge_delay_cycles(&GPIOC->IDR, GPIO_PIN_6);
+
+    GPIOB->ODR   = odr_save;
+    GPIOB->MODER = moder_save;
+
+    /* Scale before dividing: 1000/(180e6/1e6) truncates to 5 instead of 5.56. */
+    *pb3_ns = (c_pb3 * 1000u) / (SYSCLK_HZ / 1000000u);
+    *pc6_ns = (c_pc6 * 1000u) / (SYSCLK_HZ / 1000000u);
+}
+
 bool ssi_loopback_check(bool *clock_ok, bool *data_ok)
 {
     const uint32_t drive = SSI_MASTER_SCK_PIN | SSI_SLAVE_DATA_PIN;

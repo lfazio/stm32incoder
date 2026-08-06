@@ -61,6 +61,14 @@ link is dead and `stat` says `etr=NEVER REACHED n`. `-DSIMENC_TIMER_DATA=OFF`
 restores the SPI1 path, which needs no extra wire but drives DATA on the falling
 edge and has the late Error Flag.
 
+Both clock taps (PB3 and PC6) must come off the **same** point -- the receiving
+MAX490's RO output. Tapping PC6 upstream of the transceivers makes TIM8 see the
+clock 89 ns early, and every bit is then shifted that much
+before its rising edge. The `skew` command measures the propagation delay to
+each tap and prints the difference; it is the explanation for the -72 ns that
+was open for a while, which decomposed as 89 ns of wiring skew against 17 ns of
+real DMA latency.
+
 2 MHz is no longer a corner case: with no handover there is no deadline, and it
 measures like any other rate (197/197, Tmu 19.56 us, 0 glitches).
 
