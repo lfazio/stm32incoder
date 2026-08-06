@@ -13,7 +13,7 @@
 .badt{fill:#dc2626;font-weight:600}
 .key{font:10px system-ui,sans-serif;fill:#64748b}</style>
 <rect width="100%" height="100%" fill="#ffffff"/>
-<text x="58" y="24" class="ttl">DATA shifted by the clock itself (SIMENC_TIMER_DATA) — one Read Cycle at 500 kHz</text>
+<text x="58" y="24" class="ttl">One complete SSI4 Read Cycle at 500 kHz — DATA shifted by the clock itself</text>
 <text x="58" y="40" class="sub">32 clocks · T = 2000 ns · decoded PV=1 ZPD=1 PD=370085 TS=1732 · Tmu = 20.31 us</text>
 <rect x="105.1" y="50" width="18.9" height="15" fill="#bfdbfe"/>
 <text x="114.6" y="61" class="fld" text-anchor="middle">PV</text>

@@ -48,6 +48,29 @@ Send console commands with `printf 'stat\r' > /dev/ttyACM0` while a reader
 holds the port open; `help` lists them. `-DSIMENC_CLOCK_SOURCE` is AUTO by
 default (HSE, falling back to HSI).
 
+**The default data path is `SIMENC_TIMER_DATA` (ON).** No SPI1: TIM8 is clocked
+by the SSI clock on **PC6** (TIM8_CH1 AF3, morpho CN10-4) counting both edges,
+ARR=1, and two compare channels drive DMA to `GPIOB->BSRR` -- CC2 at each rising
+edge writes the next bit, CC4 at each falling edge writes from a buffer of n
+zeros then the Error Flag, so the flag lands on the last falling edge with no
+interrupt. Writing 0 to BSRR is a no-op, which is what makes that work.
+Consequences: DATA changes on the rising edge, nothing touches the line between
+F1 and R1, no EXTI3 handover and no 250 ns deadline, and n need not be a
+multiple of 8. **It needs the clock wired to PC6 as well as PB3**; without it the
+link is dead and `stat` says `etr=NEVER REACHED n`. `-DSIMENC_TIMER_DATA=OFF`
+restores the SPI1 path, which needs no extra wire but drives DATA on the falling
+edge and has the late Error Flag.
+
+2 MHz is no longer a corner case: with no handover there is no deadline, and it
+measures like any other rate (197/197, Tmu 19.56 us, 0 glitches).
+
+Three hardware facts, each of which cost a probe cycle:
+- `ARR=0` does not give an update per edge, it blocks the counter (RM0390).
+- A trigger event with TDE fires exactly once; nothing clears TIF.
+- **DMA1 cannot reach GPIO** -- it is on AHB1. Driving `GPIOB->BSRR` from DMA1
+  raises a transfer error and the hardware disables the stream. Only DMA2 can,
+  which is why the TIM1 test master always worked. Hence TIM8, on APB2.
+
 The emulator serves Read Cycles from reset; no command starts it. At power-on
 the position source is `adc`, the zero point is factory (ZPD=1), PV=1, and the
 **test master clock is 500 kHz** — raise it with `clk 2000000` to exercise the

@@ -2,8 +2,9 @@
 
 Emulates a Zettlex/Celera Motion IncOder inductive angle encoder speaking the
 **SSI4** protocol variant, on a NUCLEO-F446RE. The shaft angle comes from one
-analog input; the SSI link is driven by hardware (SPI shift register + DMA +
-timers) so no interrupt runs per bit.
+analog input; the SSI link is driven entirely by hardware — the incoming clock
+itself shifts each bit out through DMA — so no interrupt runs per bit, and none
+runs per frame on the data path at all.
 
 Every register, pin and timing value in this project is taken from a document
 in `docs/`, cited in the source. Nothing is guessed.
@@ -45,14 +46,23 @@ banner reports which oscillator locked. Force one with
 | Option | Default | Effect |
 |---|---|---|
 | `SIMENC_CLOCK_SOURCE` | `AUTO` | `HSE`, `HSI`, or try HSE and fall back |
-| `SIMENC_RAMFUNC` | `ON` | run `EXTI3_IRQHandler` from SRAM; halves its jitter |
-| `SIMENC_CLOCK_COUNTER` | `OFF` | end of message from TIM3 counting clock edges on ETR, instead of the receive byte count. Frees the frame length from being a multiple of 8. **Needs the clock on PD2** (CN7-4) |
-| `SIMENC_RISING_EDGE` | `OFF` | SPI slave `CPOL=0`, so DATA changes on the rising edge. Requires `SIMENC_CLOCK_COUNTER`. Disturbs the first bit period — see below |
-| `SIMENC_TIMER_DATA` | `OFF` | drop SPI1: shift DATA with TIM8 + DMA, clocked by the SSI clock itself. **Needs the clock on PC6** (CN10-4) |
+| `SIMENC_RAMFUNC` | `ON` | SPI path only: run `EXTI3_IRQHandler` from SRAM; halves its jitter |
+| **`SIMENC_TIMER_DATA`** | **`ON`** | **the default data path.** No SPI1: TIM8 is clocked by the SSI clock itself and DMA shifts each bit onto `GPIOB->BSRR`. **Requires the clock wired to PC6** as well as PB3 |
+| `SIMENC_CLOCK_COUNTER` | `OFF` | SPI path only: end of message from TIM3 counting clock edges on ETR instead of the receive byte count. **Needs the clock on PD2** (CN7-4) |
+| `SIMENC_RISING_EDGE` | `OFF` | SPI path only: slave `CPOL=0`, so DATA changes on the rising edge. Requires `SIMENC_CLOCK_COUNTER`, and disturbs the first bit period |
 
-The three data paths are compared in
-[How each bit reaches the wire](#how-each-bit-reaches-the-wire). The default is
-the most thoroughly measured, not the most conformant.
+`SIMENC_RAMFUNC` only affects the SPI path, whose `EXTI3_IRQHandler` does not
+exist in the default build.
+
+**The default needs one extra wire**: the SSI clock must reach **PC6**
+(`TIM8_CH1`, morpho **CN10-4**) as well as PB3. Without it the counter never
+counts, no message ever completes, and the link is simply dead — `stat` reports
+`etr=NEVER REACHED n` rather than leaving that a puzzle. Build with
+`-DSIMENC_TIMER_DATA=OFF` for the SPI path, which needs no extra wire but drives
+DATA on the wrong clock edge.
+
+The data paths are compared in
+[How each bit reaches the wire](#how-each-bit-reaches-the-wire).
 
 ## Pin map
 
@@ -62,7 +72,8 @@ Table 10; connector positions in UM1724 Tables 19 and 29.
 | Signal | Pin | AF | Arduino | Morpho | I/O structure |
 |---|---|---|---|---|---|
 | SSI **CLOCK in** (slave) | PB3 | AF5 SPI1_SCK | CN9-4 (D3) | CN10-31 | FT (5 V tolerant) |
-| SSI **DATA out** (slave) | PB4 | AF5 SPI1_MISO | CN9-6 (D5) | CN10-27 | — |
+| SSI **CLOCK in**, 2nd tap | **PC6** | **AF3 TIM8_CH1** | — | **CN10-4** | FT |
+| SSI **DATA out** (slave) | PB4 | GPIO out, written by DMA | CN9-6 (D5) | CN10-27 | — |
 | SPI1_MOSI (unused) | PB5 | AF5 | CN9-5 (D4) | CN10-29 | leave open |
 | Master CLOCK out (test) | PB10 | GPIO, or AF5 SPI2_SCK | CN9-7 (D6) | CN10-25 | FT |
 | Master DATA in (test) | PB14 | read via IDR, or AF5 SPI2_MISO | — | CN10-28 | FT |
@@ -70,9 +81,22 @@ Table 10; connector positions in UM1724 Tables 19 and 29.
 | Trace/console | PA2/PA3 | AF7 USART2 | — | — | to ST-LINK VCP |
 | Status LED (LD2) | PA5 | GPIO | CN5-6 (D13) | — | — |
 
+**The clock is tapped twice, and both taps are required in the default build.**
+The SSI clock must reach PB3 *and* PC6: PC6 clocks TIM8, which is what shifts
+each data bit out. One pad carries one alternate function at a time, so this
+cannot be folded onto PB3 — its AF5 is already `SPI1_SCK`. On the bench that is
+a jumper from CN10-31 to CN10-4; on real hardware it is a track from the MAX490
+receiver output to both pins. With `-DSIMENC_TIMER_DATA=OFF` only PB3 is needed.
+
+PB4 is a plain GPIO output in the default build — DMA writes it through `BSRR`
+— and AF5 `SPI1_MISO` only in the SPI fallback.
+
 The test-master pins carry two alternatives: by default TIM1+DMA drives PB10 as
 plain GPIO and samples PB14 through `GPIOB->IDR`, while `readspi`/`burstspi` put
 both into AF5 for SPI2. Nothing about the wiring changes between the two.
+
+PC6 is otherwise unused on this board and is 5 V tolerant, so it takes the
+MAX490 receiver output directly.
 
 SPI1 is deliberately **not** on its default PA5/PA6/PA7: PA5 carries the LD2 LED
 and is `TTa` (3.3 V only), which would both load the clock line and be unsafe
@@ -184,15 +208,19 @@ driven high, so it is off both the 250 ns handover path and the Tmu measurement.
 
 ## Loopback testing
 
-### Stage 1 — TTL loopback on the board (2 jumper wires)
+### Stage 1 — TTL loopback on the board (3 jumper wires)
 
-Both wires land on the ST morpho connector **CN10**, and the DATA wire is
+All three wires land on the ST morpho connector **CN10**, and the DATA wire is
 simply between two facing pins:
 
 | Wire | From | To |
 |---|---|---|
 | CLOCK | **CN10-25** (PB10, master out) | **CN10-31** (PB3, slave in) |
+| CLOCK, 2nd tap | **CN10-31** (PB3) | **CN10-4** (PC6, TIM8_CH1) |
 | DATA | **CN10-27** (PB4, slave out) | **CN10-28** (PB14, master in) |
+
+The second clock tap is what the default data path shifts bits with; it is not
+needed with `-DSIMENC_TIMER_DATA=OFF`.
 
 Equivalently, the clock wire can use the Arduino header: **CN9-7 (D6) → CN9-4 (D3)**.
 
@@ -208,7 +236,11 @@ wire
 ```
 
 It drives PB10 and PB4 as GPIO and verifies that PB3 and PB14 follow both
-levels, printing `OK` or `OPEN` per wire. `OPEN` means that pin pair is not
+levels, printing `OK` or `OPEN` per wire. It does **not** check the PC6 tap —
+`stat` does, reporting `etr=counted n` once a full message has been clocked, or
+`etr=NEVER REACHED n` if that wire is missing. Do not test that tap by asking
+whether the counter has seen an edge: a floating pin picks up enough noise to
+answer yes while the link stays dead. `OPEN` means that pin pair is not
 connected, whatever the wire looks like.
 
 `wire` is safe to run at any time: the slave resets SPI1 through
@@ -256,24 +288,6 @@ default is **500 kHz**.
 instead. That path only reaches 1.40625 MHz, 703.125 kHz, 351.5625 kHz and
 175.78125 kHz, but it samples DATA with a hardware shift register rather than a
 phase-programmed DMA read, so it is a useful independent cross-check.
-
-### The 2 MHz corner
-
-`clk 2000000` puts the link at the SSI maximum, which is the emulator's worst
-case: the EXTI3 handover then has half a clock period, 250 ns, to get DATA onto
-the line before the master samples it.
-
-Test it with `err on`, which forces PV=0. That matters: PV is normally 1 *and*
-the DATA line idles HIGH, so a late handover would leave D31 reading 1 and look
-correct. With PV forced to 0, a late handover shows up immediately as D31 = 1.
-
-```
-fixed 0x5A5A5
-clk 2000000
-err on
-burst 200 50       # every frame must decode pd=370085 with pv=0
-err off
-```
 
 ### Arming resets the peripheral
 
@@ -367,8 +381,9 @@ modules, `fixed 0x5A5A5`, `burst 200 50` at each rate:
 `resyncs=0` throughout, and all five variants are clean at 500 kHz (98/98 each
 for SSI1, SSI2, SSI4, SSI6, SSI9). The two top rates scatter by half to two per
 cent run to run, but they scatter by the same amount over the plain TTL jumpers
-measured the same afternoon, so that is the 2 MHz corner's own margin rather
-than anything the transceivers introduce.
+measured the same afternoon, so that is the link's own margin at those rates
+rather than anything the transceivers introduce. (Those figures are from the SPI
+data path, which is no longer the default.)
 
 The one-bit shift at 2 MHz — the test master decodes PD as 447186 =
 `(0x5A5A5 >> 1) | 0x40000` instead of 370085, consistently, which is why the
@@ -400,21 +415,25 @@ The sources agree:
 - RLS: "The MSB then appears on the DATA output at the next rising edge… At each
   subsequent rising edge of the CLOCK the next bit is transmitted."
 
-There are three data paths in the tree. Only the third is conformant, and it is
-the one to use if you care about edge behaviour:
+There are three data paths in the tree. **The default is the last one**, which
+is the only conformant one; the other two are kept because they need no extra
+wire and because the comparison is what established what "correct" costs.
 
-| | shipping default | `SIMENC_RISING_EDGE` | `SIMENC_TIMER_DATA` |
+| | **default** | SPI fallback | SPI + `RISING_EDGE` |
 |---|---|---|---|
-| Bits shifted by | SPI1 slave | SPI1 slave | TIM8 + DMA → `BSRR` |
-| DATA changes on | falling edge | rising edge, +8 ns | rising edge, −72 ns |
-| DATA quiet between F1 and R1 | yes | **no — 198/198 disturbed** | yes, 0/198 |
-| Pin handover at F1 | EXTI3, 250 ns deadline | EXTI3, 250 ns deadline | **none** |
-| Frame length | multiple of 8 | multiple of 8 | any n |
-| Extra wiring | none | clock also on PD2 | clock also on PC6 |
+| Built by | (nothing) | `-DSIMENC_TIMER_DATA=OFF` | + `RISING_EDGE`, `CLOCK_COUNTER` |
+| Bits shifted by | TIM8 + DMA → `BSRR` | SPI1 slave | SPI1 slave |
+| DATA changes on | rising edge, −72 ns | **falling edge** | rising edge, +8 ns |
+| DATA quiet between F1 and R1 | yes, 0/198 | yes | **no — 198/198 disturbed** |
+| Error Flag | **hardware, at the last falling edge** | ISR, 0.83 µs late | ISR, 0.83 µs late |
+| Gap opens with a spurious pulse | **no, 0/197** | yes, ~half of cycles | yes, ~half of cycles |
+| Pin handover at F1 | **none** | EXTI3, 250 ns deadline | EXTI3, 250 ns deadline |
+| Frame length | any n | multiple of 8 | multiple of 8 |
+| Extra wiring | clock also on PC6 | none | clock also on PD2 |
 
 All three serve every rate from 100 kHz to 2 MHz with `resyncs=0`.
 
-### The shipping default drives DATA half a period early
+### The SPI fallback drives DATA half a period early
 
 The SPI is configured `CPOL=1/CPHA=1`, so each bit is set on the falling edge —
 half a period before the specification asks for it. A controller sampling on the
@@ -422,8 +441,8 @@ falling edge reads the stream shifted by one bit position. Measured at 500 kHz:
 3760 in-message transitions, all following a falling edge by a median 8 ns, none
 following a rising edge.
 
-This is the default because it is the most thoroughly measured path, not because
-it is right.
+This is what the emulator did before the timer path existed, and it is kept as
+`-DSIMENC_TIMER_DATA=OFF` because it needs no extra wire.
 
 ### `SIMENC_RISING_EDGE` fixes the edge but disturbs the first bit period
 
@@ -447,7 +466,7 @@ edge — n-1 instead of n — and that count was exactly what detected end of
 message. `SIMENC_CLOCK_COUNTER` removed that dependency and unblocked it.
 
 Measured at 500 kHz it is correct for bits 2…32: 3944 transitions a median 8 ns
-after a rising edge, against 0 for the shipping build. 198/198 at 500 kHz, 1 MHz
+after a rising edge, against 0 for the SPI fallback. 198/198 at 500 kHz, 1 MHz
 and 2 MHz, `resyncs=0`.
 
 **But it disturbs the first bit period, on every cycle.** Nothing may touch DATA
@@ -548,7 +567,7 @@ confirmed on the analyser** under `SIMENC_TIMER_DATA`.
 
 ### The Error Flag is late in the SPI builds, fixed in the timer build
 
-Measured at 500 kHz, 198 cycles on the shipping build: the Error Flag appears
+Measured at 500 kHz, 198 cycles on the SPI fallback: the Error Flag appears
 **0.83 µs after the last rising edge** (0.77–0.87), and in **195 of 198 cycles
 the line is still holding the stale last data bit** during that window. Once
 settled the level is always right — the gap is `NOT PV` in every cycle — so this
@@ -567,7 +586,7 @@ cycles.
 
 | Build (500 kHz, PV=1) | gaps opening HIGH | pulse starts | width |
 |---|---|---|---|
-| shipping default | 96 / 197 | 8 ns after last clock | 1800 ns |
+| SPI fallback | 96 / 197 | 8 ns after last clock | 1800 ns |
 | `SIMENC_TIMER_DATA`, software flag | 100 / 197 | 896 ns | 440 ns |
 | **`SIMENC_TIMER_DATA`, CC4 DMA flag** | **0 / 197** | — | — |
 
@@ -596,10 +615,8 @@ configuration is the durable reference.)
 
 ### The ordinary case, at 500 kHz
 
-Start here rather than at the 2 MHz corner. At 500 kHz one bit is 2 µs, so a
-whole Read Cycle fits on the page at a scale where the frame layout is legible
-— which the 2 MHz figure below cannot do, because there the parts worth seeing
-are a few hundred nanoseconds wide and need their own zoom.
+At 500 kHz one bit is 2 µs, so a whole Read Cycle fits on the page at a scale
+where the frame layout is legible.
 
 ![One SSI4 Read Cycle captured at 500 kHz](docs/img/ssi4-500khz-capture.svg)
 
@@ -612,98 +629,40 @@ by 0.83 µs.
 
 The faint vertical rules mark every **clock rising edge** — the edges the
 specification says each data bit should be set on. DATA transitions land
-between them, on the falling edges, which is the shipping build's edge
+between them, on the falling edges, which is the SPI fallback's edge
 deviation ("How each bit reaches the wire", above) shown
 directly rather than asserted. The green rule is the first falling edge, which
 starts the Read Cycle and triggers the EXTI3 handover.
 
-### The 2 MHz corner
+### The same thing at 2 MHz
+
+2 MHz is the top of the specified range, and on the default data path it is not
+a special case — there is no handover, no deadline and nothing to tighten, so it
+measures like any other rate.
 
 ![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
 
-Same conventions: rising-edge rules, green first falling edge. The second panel
-zooms on the handover, which at this rate is the tightest thing in the design.
-
-| Property | Specified | Measured (200 Read Cycles) |
+| | 500 kHz | 2 MHz |
 |---|---|---|
-| Clocks per message | n = 32 | **32 on every cycle** |
-| Clock rate | 100 kHz … 2 MHz | 2.0007 MHz (period 499.84 ns mean) |
-| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **20.07 µs mean, 20.04–20.19** |
-| Idle state | CLOCK and DATA HIGH | HIGH |
-| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×199 under `err on`** |
-| Payload | PD = 370085 (0x5A5A5) | **199/200** — see the staging note below |
-| Last rising edge → Error Flag | immediately | 0.79 µs mean, 0.89 max |
-| First falling edge → DATA valid | < 0.5·T = 250 ns | **200–224 ns, 207 ns mean** (n=199) |
-| **Edge DATA changes on** | **rising** | **falling — the one known deviation, below** |
+| Clocks per cycle | 32 on every one | 32 on every one |
+| Clock rate | 0.5001 MHz | 2.0007 MHz |
+| Payload | 197/197 | 197/197 |
+| DATA moves between F1 and R1 | 0 | 0 |
+| Gaps opening with a HIGH pulse | 0 | 0 |
+| Tmu (spec 20 µs ± 1) | 20.30 µs | 19.56 µs |
 
-Every non-matching frame in both runs is a frame that was already staged when
-the command that changed it landed — the one-cycle latency the protocol
-mandates, not an error. It shows plainly in what those frames decode to. In the
-PV=1 run the single mismatch is `C91A2CE9`, PD = 74565 (0x12345), which is the
-value in force before the capture's `fixed 0x5A5A5`. The `err on` run shows the
-same thing twice, once per command: one frame with the old PD, one with the
-correct PD but PV still 1 — and correspondingly one LOW gap among 199 HIGH.
-This is distinct from the stale opening frame that `ssi_arm()`'s peripheral
-reset fixed; that one was the transmit buffer, and it is gone.
+Both land inside the Tmu window from the same dynamic correction, which is the
+point of measuring `T` per frame rather than assuming it: the half-period term
+it removes is 1 µs at 500 kHz and 0.25 µs at 2 MHz.
 
-Tmu is quoted from the PV=1 run only. Under `err on` the gap is HIGH, so there
-is no falling edge to DATA-HIGH interval to measure; conversely the handover is
-quoted from the `err on` run only, because PV=1 puts a 1 in D31 and the line
-already idles HIGH, which would make a late handover invisible.
 
-What measuring actually changed:
+## Critical path in SRAM (SPI path only)
 
-- **Tmu was out of spec** at 21.01 µs, because end-of-message is detected on the
-  last *rising* edge — half a clock period after the falling edge the
-  specification measures from — and the interrupt adds latency on top.
+> The default data path has no `EXTI3_IRQHandler` and no per-frame deadline, so
+> none of this applies to it. It is kept for `-DSIMENC_TIMER_DATA=OFF`, and
+> because the measurement is a useful record of what SRAM execution buys on a
+> Cortex-M4.
 
-  The half-period term is clock-rate dependent (0.25 µs at 2 MHz, 5 µs at
-  100 kHz), so it is now **measured per frame rather than assumed**: the receive
-  DMA's half-transfer event fires exactly `n_bits/2` clocks before
-  transfer-complete, and both run in non-critical handlers, so `T` comes for
-  free without touching `EXTI3_IRQHandler` and its 26 ns of margin. `stat`
-  reports the measured `T`. Verified at both ends of the range:
-
-  | Master clock | Measured T | Tmu (spec 20 µs ± 1) |
-  |---|---|---|
-  | 2.000 MHz | 498 ns | **20.07 µs** mean, 20.04–20.19 |
-  | 100.0 kHz | 10000 ns | **20.14 µs** mean, 20.08–20.24 |
-
-  Both ends of the specified range — a 20× span in clock period — land within
-  0.15 µs of the 20 µs target, which is the point of measuring `T` per frame
-  rather than assuming it. Both crept up ~0.15 µs when the half-transfer handler
-  gained an `NDTR` read and the ADC started free-running; still well inside the
-  window, so `GAP_ISR_OVERHEAD_NS` was left alone rather than chased.
-
-  With the previous fixed correction the slow case would have sat near 22.6 µs,
-  outside the window.
-- **The Error Flag appears ~0.7 µs after the last rising edge**, not immediately:
-  the end-of-frame interrupt has to run first, so the line still shows D0 for
-  that long. It is 3.5 % of the Tmu window, and SSI4 carries validity in PV
-  inside the frame rather than in the trailing flag, but a controller that
-  samples the Error Flag very early would read the last data bit instead.
-- **The handover margin is thin.** 224 ns worst case against a 250 ns budget is
-  about 10 %, after moving the handler to SRAM (it was 232 ns / 7 % in flash).
-  It passes, but it is not the comfortable margin estimated before measuring.
-- **HSI cannot meet the Time Stamp accuracy, so HSE is now the default.**
-  The field is specified accurate to "better than 1 % (based on the system
-  oscillator)". Measured directly against the analyser's crystal by regressing
-  the decoded TS field against capture time over a 0.4 s span:
-
-  | Clock source | Clock period | Time Stamp tick | Accuracy | Spec (< 1 %) |
-  |---|---|---|---|---|
-  | HSI, 16 MHz RC | 493.02 ns | 9.8619 µs | **+1.401 %** | ✗ FAIL |
-  | HSE, 8 MHz ST-LINK MCO | 500.03 ns | 9.9979 µs | **+0.021 %** | ✓ PASS |
-
-  `SIMENC_CLOCK_SOURCE` now defaults to `AUTO`: try HSE, fall back to HSI if the
-  board's solder bridges do not route the MCO. The banner reports which one
-  locked, and flags `[timestamp OUT OF SPEC]` when it had to fall back.
-
-  Measure this over a long span. A first attempt across only 13 ms gave a
-  spurious +3.16 % for HSI, because the ~90 µs Read Cycle period beats against
-  the 100 µs position-update tick that latches TS.
-
-## Critical path in SRAM
 
 There is **no TCM on this part** — tightly-coupled memory is a Cortex-M7 feature
 and the STM32F446 is a Cortex-M4. The equivalent is to execute from SRAM, which
@@ -866,13 +825,16 @@ at a time, and the timer engine restores the pin afterwards.
 
 ## Known limitations
 
-- **The shipping default drives DATA on the wrong clock edge**, half a period
-  early. `SIMENC_TIMER_DATA` fixes it; see
-  [How each bit reaches the wire](#how-each-bit-reaches-the-wire).
+- **The default needs the SSI clock on PC6** (CN10-4) as well as PB3. Without
+  it nothing works; build with `-DSIMENC_TIMER_DATA=OFF` if you cannot fit that
+  wire, at the cost of DATA landing on the wrong clock edge.
 - **The Error Flag is late in the SPI builds** — 0.83 µs after the last rising
   edge, and because it is late the gap opens with a spurious HIGH pulse on
-  about half of all cycles. Fixed in `SIMENC_TIMER_DATA`, where hardware drives
-  it at the last falling edge.
+  about half of all cycles. Fixed in the default build, where hardware drives it
+  at the last falling edge.
+- **The −72 ns is unexplained.** Each bit is written slightly before its rising
+  edge rather than just after. Harmless for a controller sampling on the falling
+  edge, but not understood.
 - `ssi_slave` supports byte-aligned frame lengths only (n = 8/16/24/32) *in the
   default build*, so SSI1, SSI2, SSI4, SSI6 and SSI9 are implemented and SSI7
   (n=30) and SSI8 (n=18) are not. `SIMENC_CLOCK_COUNTER` and
@@ -882,14 +844,15 @@ at a time, and the timer engine restores the pin afterwards.
   parameters, which proves round-trip consistency rather than conformance to an
   external reference vector.
 - Single-turn only; the multi-turn variants (SSI31/32) are not implemented.
-- The EXTI3 handover has a hard deadline (it does not exist under
-  `SIMENC_TIMER_DATA`, which has no handover at all): it must set DATA to the SPI output
+- **SPI path only** — the EXTI3 handover has a hard deadline (the default
+  build has no handover at all): it must set DATA to the SPI output
   within half a clock period of the first falling edge — 250 ns at the 2 MHz
   maximum, 1 µs at the 500 kHz power-on default. It is the highest-priority
   interrupt in the system for that reason, and is verified at 2.000 MHz with PV
   forced to 0 (`clk 2000000` then `err on`). If D31 is ever seen wrong, this is
   where to look — drop the clock rate to confirm.
-- **The handover margin is ~10 % and that is close to inherent.** See
+- **SPI path only** — the handover margin is ~10 % and that is close to
+  inherent. See
   "Critical path in SRAM" above for the measurement. Roughly 200 ns of the
   budget is interrupt entry and EXTI propagation rather than the handler body,
   which is three register writes, so further code tuning has little headroom.
