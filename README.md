@@ -277,6 +277,23 @@ went from `ok=198 bad=0` to `ok=7 bad=191` if `wire` had run first. With the
 reset it is `ok=198 bad=0` either way, and the first Read Cycle after `wire` —
 which used to be reliably wrong — now decodes correctly too.
 
+### KNOWN DEVIATION — the Error Flag is late, and it should not be
+
+Measured at 500 kHz, 198 cycles: the Error Flag appears **0.83 µs after the last
+rising edge** (0.77–0.87), and in **195 of 198 cycles the line is still holding
+the stale last data bit** during that window. Once settled the level is always
+right — the gap is `NOT PV` in every cycle — so this is purely a timing defect.
+
+5.4.1 note 3 has the data line set by the Error Flag *at* the last rising edge.
+At 2 MHz 0.83 µs hides inside a 20 µs gap and looks harmless, which is how it
+sat unnoticed in the table above as a one-line "0.79 µs late". At 500 kHz it is
+**41% of a bit period** and plainly visible on the capture.
+
+The cause is that the Error Flag is driven by software, from
+`end_of_message()`, so it inherits interrupt latency. It is not clocked by
+anything. That is the same root cause as the deviation below, and it has the
+same fix: a data path driven by the SSI clock rather than by an ISR.
+
 ### KNOWN DEVIATION — DATA changes on the falling edge, and it should not
 
 **The emulator drives each data bit half a clock period earlier than SSI

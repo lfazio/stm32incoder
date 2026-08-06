@@ -229,7 +229,23 @@ static void ssi_arm(void)
     clock_counter_arm();
 #endif
 
+#if !defined(SIMENC_RISING_EDGE)
     SSI_SLAVE_SPI->CR1 |= SPI_CR1_SPE;
+#else
+    /* Deferred to the first falling edge, in EXTI3_IRQHandler.
+     *
+     * With CPOL=0 the SPI's idle clock level is LOW, but the SSI clock idles
+     * HIGH between messages. Enabling SPE here would arm the state machine
+     * against a level it reads as already mid-bit, and the measured symptom was
+     * every second Read Cycle coming out empty -- 32 clocks either way, but the
+     * payload alternating with C0000000. Waiting until the clock has gone low
+     * arms it against the level it expects.
+     *
+     * The reason this is affordable now: it costs the receive path one capture
+     * edge, n-1 instead of n, and that count used to be what detected end of
+     * message. With SIMENC_CLOCK_COUNTER counting the wire instead, nothing
+     * depends on it. */
+#endif
 
     /* The SPI drives MISO LOW whenever it holds the pin and no clock is
      * running (measured: PB4 reads 0 with the pin in AF mode and the slave
@@ -307,12 +323,27 @@ static void gpio_init(void)
     HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 }
 
-/* Slave (MSTR=0), CPOL=1 idle-high clock, CPHA=1 sample on the second (rising)
- * edge so DATA changes on the falling edge, 8-bit, MSB first. SSM=1 with SSI=0
- * keeps the slave permanently selected: SSI has no chip select line. */
+/* Slave (MSTR=0), 8-bit, MSB first. SSM=1 with SSI=0 keeps the slave
+ * permanently selected: SSI has no chip select line.
+ *
+ * CPHA=1 always: the leading clock edge shifts a bit out, the trailing edge
+ * samples. CPOL chooses which edge is which, and that is the whole difference
+ * between the two builds:
+ *
+ *   CPOL=1  leading = falling.  DATA changes on the falling edge. Half a period
+ *           early against the specification -- the known deviation.
+ *   CPOL=0  leading = rising.   DATA changes on the rising edge, which is what
+ *           5.4.1 note 2, POSITAL and RLS all describe.
+ *
+ * CPOL=0 also makes the SPI's idle level LOW, while the SSI clock idles HIGH.
+ * That mismatch is why SPE cannot be asserted in the gap here -- see ssi_arm(). */
 static inline void spi_configure(void)
 {
+#if defined(SIMENC_RISING_EDGE)
+    SSI_SLAVE_SPI->CR1 = SPI_CR1_CPHA | SPI_CR1_SSM;
+#else
     SSI_SLAVE_SPI->CR1 = SPI_CR1_CPOL | SPI_CR1_CPHA | SPI_CR1_SSM;
+#endif
     SSI_SLAVE_SPI->CR2 = SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN;
 }
 
@@ -575,6 +606,15 @@ SSI_RAMFUNC void EXTI3_IRQHandler(void)
      * clock mid-burst. Never write a shared register wholesale from an ISR. */
     SSI_SLAVE_GPIO->MODER =
         (SSI_SLAVE_GPIO->MODER & ~DATA_MODER_MASK) | DATA_MODER_AF;
+#if defined(SIMENC_RISING_EDGE)
+    /* The clock is low now, which is CPOL=0's idle level, so this is the first
+     * moment the state machine can be armed correctly. It has to happen before
+     * the rising edge that follows -- half a period, 250 ns at 2 MHz -- because
+     * that edge is when D(n-1) is due on the pin. This is the extra work the
+     * rising-edge build puts on the tightest path in the design; measure the
+     * handover before trusting it at 2 MHz. */
+    SSI_SLAVE_SPI->CR1 |= SPI_CR1_SPE;
+#endif
     EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
     EXTI->PR   = SSI_SLAVE_SCK_PIN;
 }

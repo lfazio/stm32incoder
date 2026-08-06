@@ -213,6 +213,15 @@ latch is 10 kHz** (4.12 says "< 0.1 ms", and 5.5.1 pins it by calling ASI2's
 Stamp counter ticks at 100 kHz**, 10 us resolution (5.4.2). 100 kHz is the
 counter, not the latch -- do not "fix" the update rate to 100 kHz.
 
+**Known deviation, unfixed: the Error Flag is late.** Measured at 500 kHz over
+198 cycles, it appears 0.83 us after the last rising edge (0.77..0.87) and in
+195 of them the line still holds the stale last data bit meanwhile. The level is
+always right once settled. 5.4.1 note 3 sets the line by the Error Flag *at* the
+last rising edge. At 2 MHz this hides inside the 20 us gap; at 500 kHz it is 41%
+of a bit period. Cause: the Error Flag is driven by software in
+`end_of_message()`, so it inherits interrupt latency -- the same root cause as
+the edge deviation below.
+
 **Known deviation, unfixed: DATA changes on the falling edge and it should
 change on the rising edge.** POSITAL, RLS and IncOder 5.4.1 note 2 all say the
 encoder sets each bit on the rising edge, with the controller reading it in the

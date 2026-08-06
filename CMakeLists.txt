@@ -46,6 +46,18 @@ option(SIMENC_RAMFUNC "Run the critical SSI handlers from SRAM" ON)
 # counter never counts and the link goes dead. See the README.
 option(SIMENC_CLOCK_COUNTER "End of message from a TIM3 clock counter" OFF)
 
+# Put DATA on the rising clock edge, which is what the specification requires.
+# Needs SIMENC_CLOCK_COUNTER: it defers SPE to the first falling edge, which
+# costs the receive path one capture edge, and that count is what the default
+# end-of-message detection uses. EXPERIMENTAL -- see the README.
+option(SIMENC_RISING_EDGE "DATA changes on the rising clock edge" OFF)
+if(SIMENC_RISING_EDGE AND NOT SIMENC_CLOCK_COUNTER)
+  message(FATAL_ERROR
+    "SIMENC_RISING_EDGE requires SIMENC_CLOCK_COUNTER: deferring SPE to the "
+    "first falling edge costs the receive path one capture edge, so end of "
+    "message can no longer come from the receive byte count.")
+endif()
+
 set(HAL_MODULES
     hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr
     hal_pwr_ex hal_flash hal_flash_ex hal_flash_ramfunc hal_adc hal_adc_ex
@@ -85,6 +97,7 @@ target_compile_definitions(simenc.elf PRIVATE
     SIMENC_CLOCK_SOURCE_${SIMENC_CLOCK_SOURCE}=1
     $<$<BOOL:${SIMENC_RAMFUNC}>:SIMENC_RAMFUNC=1>
     $<$<BOOL:${SIMENC_CLOCK_COUNTER}>:SIMENC_CLOCK_COUNTER=1>
+    $<$<BOOL:${SIMENC_RISING_EDGE}>:SIMENC_RISING_EDGE=1>
 )
 
 target_compile_options(simenc.elf PRIVATE
