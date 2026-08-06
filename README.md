@@ -300,18 +300,34 @@ during the low phase that follows. Measured on our output at 2 MHz, bits 1…31
 change **10 ns after the falling edge** and none after a rising edge — half a
 period early.
 
-Why it is not a one-line fix: **SSI's data phase is not an SPI slave mode.**
-With the clock idling high, CPOL=1/CPHA=1 changes data on the falling edge (what
-we do, half a period early) and CPOL=1/CPHA=0 changes it on the rising edge but
-presents the MSB a full bit early. CPOL=0/CPHA=1 has the right phase, but the
-slave cannot synchronise when the clock idles high — tried, and it broke the
-link outright (`ok=40 bad=158`, `resyncs=2`).
+**The phase fix itself is known and proven.** Setting the slave to `CPOL=0`
+(keeping `CPHA=1`) moves the output to the specified edge, measured on the
+analyser at 2 MHz:
 
-The workable route, not yet done: with CPOL=0/CPHA=1, enable `SPE` only *after*
-the first falling edge, so the peripheral starts from the idle-low state it
-expects and its first edge is rising #1, which is exactly when the MSB is due.
-That moves the `SPE` write into `EXTI3_IRQHandler`, which has ~26 ns of margin
-today, so it needs measuring on the analyser rather than reasoning.
+| slave setting | DATA moves | verdict |
+|---|---|---|
+| `CPOL=1/CPHA=1` (shipping) | 9 ns after the **falling** edge | half a period early |
+| `CPOL=0/CPHA=1` | **7 ns after the rising edge** | matches the specification |
+
+The existing falling-edge EXTI handover stays correct either way, because the
+pin must be under SPI control by rising edge 1, when the MSB is due — so the
+250 ns budget and its ~26 ns margin are unchanged.
+
+**What blocks it is frame sequencing, not phase.** With `CPOL=0` the capture
+still counts 32 clocks on every cycle, but only every other frame carries the
+payload: measured `ok=99 bad=101` over 200 cycles, alternating between a correct
+frame and an empty `C0000000`. Decoding the same capture at four different
+sample points (rising + 0.10/0.25/0.45/0.70 T) gives an identical split, so it
+is not a sampling-phase artefact — the slave itself emits an empty frame every
+second cycle. The suspicion is the SPI's state machine when `SPE` is asserted
+during the gap with the clock idling high, which is not `CPOL=0`'s idle level;
+enabling `SPE` only after the first falling edge would fix the idle state but
+costs the RX path one capture edge (n-1 instead of n), which is what
+end-of-message counts.
+
+So the remaining work is to re-establish end-of-message detection independently
+of the RX byte count — the same hardware clock counter that SSI7 and SSI8 need
+(see "How difficult would SSI7/SSI8 be"). One change unblocks both.
 
 Until then, the emulator interoperates with a controller that samples on the
 **rising** edge, which is what the on-board test master does — so the loopback

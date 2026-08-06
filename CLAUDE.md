@@ -219,14 +219,23 @@ encoder sets each bit on the rising edge, with the controller reading it in the
 low phase that follows. We are half a clock period early, so a controller
 sampling on the falling edge reads the stream shifted by one bit.
 
-It is not a one-line change: SSI's data phase is not an SPI slave mode. With an
-idle-high clock, CPOL=1/CPHA=1 changes on the falling edge (ours), CPOL=1/CPHA=0
-changes on the rising edge but presents the MSB a full bit early, and
-CPOL=0/CPHA=1 has the right phase but will not synchronise with the clock idling
-high -- tried, broke the link, ok=40 bad=158. The route that should work is
-CPOL=0/CPHA=1 with SPE enabled only after the first falling edge, which moves
-the SPE write into EXTI3_IRQHandler and its ~26 ns of margin. Measure it, do not
-reason about it.
+The phase fix is proven: slave `CPOL=0` with `CPHA=1` moves DATA to 7 ns after
+the *rising* edge, against 9 ns after the falling edge today. Measured on the
+analyser at 2 MHz. The falling-edge EXTI handover stays correct either way,
+since the pin must be under SPI control by rising edge 1.
+
+What blocks it is frame sequencing. With CPOL=0 the clock count stays right, 32
+on every cycle, but only alternate frames carry the payload: ok=99 bad=101 over
+200 cycles, alternating with an empty C0000000, and identical at four different
+sample points -- so the slave emits an empty frame every second cycle rather
+than it being a sampling artefact. Likely the SPI state machine being enabled
+during the gap with the clock idling high, which is not CPOL=0's idle level.
+Enabling SPE only after the first falling edge fixes the idle state but costs
+the RX path one capture edge, n-1 instead of n, and that count is exactly what
+end-of-message uses.
+
+So the fix needs end-of-message detection that does not depend on the RX byte
+count -- the same hardware clock counter SSI7/SSI8 need. Do these together.
 
 Note the loopback proves nothing about this: the on-board test master samples on
 the rising edge, matching our own bug.
