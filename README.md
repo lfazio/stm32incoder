@@ -297,7 +297,7 @@ What the sources say, consistently:
 
 So the encoder must **set** each bit on the rising edge; the controller reads it
 during the low phase that follows. Measured on our output at 2 MHz, bits 1…31
-change **10 ns after the falling edge** and none after a rising edge — half a
+change **9 ns after the falling edge** and none after a rising edge — half a
 period early.
 
 **The phase fix itself is known and proven.** Setting the slave to `CPOL=0`
@@ -326,8 +326,24 @@ costs the RX path one capture edge (n-1 instead of n), which is what
 end-of-message counts.
 
 So the remaining work is to re-establish end-of-message detection independently
-of the RX byte count — the same hardware clock counter that SSI7 and SSI8 need
-(see "How difficult would SSI7/SSI8 be"). One change unblocks both.
+of the RX byte count. That is the same hardware clock counter SSI7 and SSI8
+need, so one change unblocks all three.
+
+**The planned fix, and what it needs from the hardware.** A timer in
+external-clock mode counts SSI clock edges with `ARR = n-1`; its update event
+*is* end of message, for any n, byte-aligned or not. The clock must therefore
+reach a timer input as well as `SPI1_SCK`, and it cannot share PB3: that pad's
+AF1 is `TIM2_CH2` and its AF5 is `SPI1_SCK` (DS10693 Table 11), and a pad
+carries one alternate function at a time.
+
+So it needs **one extra connection: the SSI clock also wired to PD2**, which is
+`TIM3_ETR` on **AF2** (DS10693 Table 11) and comes out on morpho **CN7 pin 4**
+(UM1724 Table 29). On the bench that is a third jumper, from CN10-25; on real
+hardware it is a track from the MAX490 receiver output to both pins. TIM3 is
+free — only TIM1, TIM2, TIM6 and TIM7 are in use.
+
+Until that wire exists the change cannot be validated: without it the counter
+never counts and the link stops dead.
 
 Until then, the emulator interoperates with a controller that samples on the
 **rising** edge, which is what the on-board test master does — so the loopback
@@ -414,18 +430,29 @@ configuration is the durable reference.)
 | Property | Specified | Measured (200 Read Cycles) |
 |---|---|---|
 | Clocks per message | n = 32 | **32 on every cycle** |
-| Clock rate | 100 kHz … 2 MHz | 2.0008 MHz (period 499.79 ns mean) |
-| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **19.95 µs mean, 19.90–20.06** |
+| Clock rate | 100 kHz … 2 MHz | 2.0007 MHz (period 499.84 ns mean) |
+| Tmu, last falling edge → DATA HIGH | 20 µs ± 1 µs | **20.07 µs mean, 20.04–20.19** |
 | Idle state | CLOCK and DATA HIGH | HIGH |
-| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×299 under `err on`** |
-| Payload | PD = 370085 (0x5A5A5) | **200/200 decode correctly** |
-| First falling edge → DATA valid | < 0.5·T = 250 ns | **192–224 ns, 209 ns mean** (n=299) |
+| Gap level = Error Flag (inverse of PV) | LOW when PV=1 | LOW ×200; **HIGH ×199 under `err on`** |
+| Payload | PD = 370085 (0x5A5A5) | **199/200** — see the staging note below |
+| Last rising edge → Error Flag | immediately | 0.79 µs mean, 0.89 max |
+| First falling edge → DATA valid | < 0.5·T = 250 ns | **200–224 ns, 207 ns mean** (n=199) |
+| **Edge DATA changes on** | **rising** | **falling — the one known deviation, below** |
 
-The PV=1 run is clean on all 200 cycles, including the first. It was 199/200
-before `ssi_arm()` began resetting the peripheral — that stale opening frame was
-the transmit-buffer bug, not an inherent artefact. The `err on` run still shows
-one non-matching frame, which is the genuine one-cycle staging latency: it was
-staged before the `err` command took effect.
+Every non-matching frame in both runs is a frame that was already staged when
+the command that changed it landed — the one-cycle latency the protocol
+mandates, not an error. It shows plainly in what those frames decode to. In the
+PV=1 run the single mismatch is `C91A2CE9`, PD = 74565 (0x12345), which is the
+value in force before the capture's `fixed 0x5A5A5`. The `err on` run shows the
+same thing twice, once per command: one frame with the old PD, one with the
+correct PD but PV still 1 — and correspondingly one LOW gap among 199 HIGH.
+This is distinct from the stale opening frame that `ssi_arm()`'s peripheral
+reset fixed; that one was the transmit buffer, and it is gone.
+
+Tmu is quoted from the PV=1 run only. Under `err on` the gap is HIGH, so there
+is no falling edge to DATA-HIGH interval to measure; conversely the handover is
+quoted from the `err on` run only, because PV=1 puts a 1 in D31 and the line
+already idles HIGH, which would make a late handover invisible.
 
 What measuring actually changed:
 
@@ -442,12 +469,14 @@ What measuring actually changed:
 
   | Master clock | Measured T | Tmu (spec 20 µs ± 1) |
   |---|---|---|
-  | 2.000 MHz | 498 ns | **19.95 µs** mean, 19.90–20.06 |
-  | 100.0 kHz | 10000 ns | **20.04 µs** mean, 19.96–20.08 |
+  | 2.000 MHz | 498 ns | **20.07 µs** mean, 20.04–20.19 |
+  | 100.0 kHz | 10000 ns | **20.14 µs** mean, 20.08–20.24 |
 
   Both ends of the specified range — a 20× span in clock period — land within
-  0.05 µs of the 20 µs target, which is the point of measuring `T` per frame
-  rather than assuming it.
+  0.15 µs of the 20 µs target, which is the point of measuring `T` per frame
+  rather than assuming it. Both crept up ~0.15 µs when the half-transfer handler
+  gained an `NDTR` read and the ADC started free-running; still well inside the
+  window, so `GAP_ISR_OVERHEAD_NS` was left alone rather than chased.
 
   With the previous fixed correction the slow case would have sat near 22.6 µs,
   outside the window.
@@ -500,9 +529,12 @@ margin from 7.2 % to 10.4 %. That fits the ART accelerator's behaviour — flash
 is quick when its instruction cache hits and occasionally slow when it does not,
 while SRAM is uniform.
 
-Re-measured after `ssi_arm()` gained the peripheral reset: 192–224 ns over 299
-cycles, so the worst case is unchanged at 224 ns — the reset costs the handover
-nothing.
+Re-measured against the current tree, which has since gained `ssi_arm()`'s
+peripheral reset, the `NDTR`-based period measurement and a free-running ADC:
+**200–224 ns, 207 ns mean** over 199 cycles. Worst case is unchanged at 224 ns,
+so none of those three costs the handover anything — which matters most for the
+ADC, since that one adds bus traffic and the handover was measured to be
+bus-contention sensitive rather than flash-fetch sensitive.
 
 Two caveats worth keeping in mind. The 8 ns worst-case gain is exactly one
 sample period at 125 MS/s, so the robust result here is the halved jitter, not
@@ -521,9 +553,10 @@ and `ssi_arm` — was measured and is *worse*:
 | EXTI3 only (shipping) | **0.64 µs** mean, 0.71 max | 19.89 µs | 6472 B |
 | Whole path in SRAM | 0.71 µs mean, 0.75 max | 20.03 µs | 7040 B |
 
-(Both rows were measured before `ssi_arm()` gained the peripheral reset, so
-their absolute Tmu reads 19.89 µs rather than today's 19.95 µs. They were taken
-under identical conditions, so the comparison between them still stands.)
+(Both rows predate `ssi_arm()`'s peripheral reset, the `NDTR`-based period
+measurement and the free-running ADC, so their absolute Tmu reads 19.89 µs
+against today's 20.07 µs. They were taken under identical conditions as each
+other, so the comparison between them still stands.)
 
 That is the same effect seen above, pointing the other way: SRAM trades mean
 speed for determinism. The handover needs the tail bounded because it has a hard
@@ -624,7 +657,7 @@ at a time, and the timer engine restores the pin afterwards.
   The emulator does measure `T` — from the receive DMA's half-transfer to
   transfer-complete interval — and sets the gap to `Tmu − 0.5·T` less a fixed
   interrupt overhead, so Tmu lands inside spec across the whole clock range
-  (verified 19.95 µs at 2 MHz and 20.04 µs at 100 kHz). The residual deviation
+  (verified 20.07 µs at 2 MHz and 20.14 µs at 100 kHz). The residual deviation
   is at the *start* of the gap, not its length: the Error Flag appears ~0.7 µs
   late because the end-of-frame interrupt has to run first.
 
