@@ -122,6 +122,26 @@
 #define SSI_DATA_DMA_STREAM      DMA2_Stream3
 #define SSI_DATA_DMA_CHANNEL     7u
 #define SSI_DATA_DMA_IRQn        DMA2_Stream3_IRQn
+
+/* Error Flag, driven by hardware at the last falling edge.
+ *
+ * 5.4.1 note 3 hands the data line to the Error Flag after the last rising
+ * edge, but D0 must still be readable by a controller sampling on the falling
+ * edge that follows it. The last falling edge is therefore the only instant
+ * that satisfies both, and it is an edge the counter already sees: channel 4
+ * compares against CCR4=1, which matches when the both-edge counter is at 1 --
+ * every falling edge.
+ *
+ * There are n+1 falling edges in a Read Cycle (F1 starts it, F(n+1) ends it),
+ * so the buffer is n+1 words: n zeros and then the flag. Writing 0 to BSRR
+ * sets and resets nothing, so the first n are deliberate no-ops and only the
+ * last one moves the line. No interrupt is involved, which is the whole point.
+ *
+ * TIM8_CH4 -> DMA2 Stream 7, Channel 7 [RM0390 Rev 9 Table 29]. Stream 4 also
+ * carries a TIM8 request but belongs to the test master's IDR sampler.
+ */
+#define SSI_EF_DMA_STREAM        DMA2_Stream7
+#define SSI_EF_DMA_CHANNEL       7u
 #define SSI_DATA_BSRR            (&GPIOB->BSRR)
 
 #define SSI_MASTER_SPI           SPI2

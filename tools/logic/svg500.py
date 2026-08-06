@@ -37,17 +37,42 @@ T=(c[-1]-c[0])/(len(c)-1)                      # clock period, measured
 # Falling-edge builds set the bit at the falling edge; rising-edge builds set it
 # half a period later. Sampling a quarter period into the cell works for both,
 # so the offset is all that changes.
-RISING = (len(sys.argv) > 3 and sys.argv[3] == "rising")
+MODE   = sys.argv[3] if len(sys.argv) > 3 else "falling"
+RISING = MODE in ("rising", "timer")
+TITLE = {
+ "falling": "One complete SSI4 Read Cycle at 500 kHz — the ordinary operating point",
+ "rising":  "DATA on the rising edge (SIMENC_RISING_EDGE) — one Read Cycle at 500 kHz",
+ "timer":   "DATA shifted by the clock itself (SIMENC_TIMER_DATA) — one Read Cycle at 500 kHz",
+}[MODE]
+KEY = {
+ "falling": "clock rising edges — one per bit; DATA should change on these and changes half a period early instead",
+ "rising":  "clock rising edges — one per bit; DATA now changes on these, 8 ns after, as 5.4.1 note 2 requires",
+ "timer":   "clock rising edges — one per bit; each bit is written at its rising edge and stays valid across the falling edge, where the controller samples",
+}[MODE]
 bits=[val(t + (T*0.75 if RISING else T*0.25), 1) for t in c]
 raw=0
 for b in bits: raw=(raw<<1)|b
 pv=(raw>>31)&1; zpd=(raw>>30)&1; pd=(raw>>11)&0x7FFFF; ts=raw&0x7FF
 
-# DATA returns HIGH one Tmu after the last falling edge.
-tmu=None;i=bisect.bisect_right(dt,c[-1])
+# DATA returns HIGH one Tmu after the last falling edge and stays HIGH until the
+# next Read Cycle, so Tmu is the LAST rise in the gap. There can be an earlier
+# one: when the last data bit D0 is 1 the line stays high until the Error Flag
+# interrupt pulls it down, which shows as a pulse at the start of the gap. That
+# is a real defect, not a plotting artefact -- it is annotated below rather than
+# skipped over.
+tmu=None; i=bisect.bisect_right(dt,c[-1]); stale=None
 while i<len(rows) and dt[i]<cyc[6][0]:
-    if rows[i][2]==1 and rows[i-1][2]==0: tmu=dt[i];break
+    if rows[i][2]==1 and rows[i-1][2]==0:
+        if tmu is not None or stale is None: stale = dt[i] if tmu is None else stale
+        tmu=dt[i]
     i+=1
+# the stale-bit pulse: line high at the last clock, dropping later in the gap
+pulse=None
+if val(c[-1] + T*0.6, 1) == 1:
+    j=bisect.bisect_right(dt,c[-1])
+    while j<len(rows) and dt[j]<cyc[6][0]:
+        if rows[j][2]==0 and rows[j-1][2]==1: pulse=dt[j]; break
+        j+=1
 
 W=980;PAD=58;RIGHT=14
 tstart=c[0]-5e-6; tend=(tmu if tmu else c[-1])+9e-6
@@ -55,9 +80,7 @@ def X(t): return PAD+(W-PAD-RIGHT)*(t-tstart)/(tend-tstart)
 
 s=[]
 Y=64
-s.append(f'<text x="{PAD}" y="{Y-40}" class="ttl">{"DATA on the rising edge (SIMENC_RISING_EDGE) — one Read Cycle at 500 kHz"
-              if RISING else
-              "One complete SSI4 Read Cycle at 500 kHz — the ordinary operating point"}</text>')
+s.append(f'<text x="{PAD}" y="{Y-40}" class="ttl">{TITLE}</text>')
 s.append(f'<text x="{PAD}" y="{Y-24}" class="sub">32 clocks · T = {T*1e9:.0f} ns · decoded PV={pv} ZPD={zpd} PD={pd} TS={ts} · Tmu = {(tmu-c[-1])*1e6:.2f} us</text>')
 
 # Field bands over the bit cells: bit i occupies falling edge i .. i+1.
@@ -95,6 +118,7 @@ def mark(t,lab,cls,dy=0):
              f'class="ann {cls}t" text-anchor="{anc}">{lab}</text>')
 mark(c[0],"first falling edge","f1")
 mark(c[-1],"32nd clock","gd")
+if pulse: mark(pulse,"stale D0 held until the Error Flag lands","bad",26)
 if tmu: mark(tmu,f"DATA HIGH again — Tmu = {(tmu-c[-1])*1e6:.2f} us","gd",13)
 xg0,xg1=X(c[-1]),X(tmu if tmu else c[-1])
 s.append(f'<text x="{(xg0+xg1)/2:.1f}" y="{Y+80}" class="gaplab" text-anchor="middle">gap: Error Flag = NOT PV = 0</text>')
@@ -110,13 +134,13 @@ svg=f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="222" viewBox
 .gd{{stroke:#94a3b8;stroke-width:1;stroke-dasharray:3 3}} .gdt{{fill:#475569}}
 .rg{{stroke:#cbd5e1;stroke-width:0.7}}
 .f1{{stroke:#047857;stroke-width:1.5}} .f1t{{fill:#047857;font-weight:600}}
+.bad{{stroke:#dc2626;stroke-width:1.3;stroke-dasharray:2 2}}
+.badt{{fill:#dc2626;font-weight:600}}
 .key{{font:10px system-ui,sans-serif;fill:#64748b}}</style>
 <rect width="100%" height="100%" fill="#ffffff"/>
 {chr(10).join(s)}
 <line x1="{PAD}" y1="206" x2="{PAD+22}" y2="206" class="rg"/>
-<text x="{PAD+28}" y="209" class="key">{"clock rising edges — one per bit; DATA now changes on these, 8 ns after, as 5.4.1 note 2 requires"
-               if RISING else
-               "clock rising edges — one per bit; DATA should change on these and changes half a period early instead"}</text>
+<text x="{PAD+28}" y="209" class="key">{KEY}</text>
 </svg>'''
 open(out,"w").write(svg)
 print(f"wrote {out}  T={T*1e9:.1f}ns  raw={raw:08X} pv={pv} zpd={zpd} pd={pd} ts={ts}")

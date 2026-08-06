@@ -117,6 +117,8 @@ static uint8_t               s_nbytes;
 #if defined(SIMENC_TIMER_DATA)
 /* One BSRR word per message bit. 32 is the longest frame the variants use. */
 static volatile uint32_t     s_bsrr[32];
+/* One BSRR word per falling edge, n+1 of them: n no-ops then the Error Flag. */
+static volatile uint32_t     s_ef[33];
 #endif
 static volatile uint8_t      s_tx[4];
 static volatile uint8_t      s_rx[4];
@@ -205,7 +207,13 @@ static void stage_frame(void)
         uint32_t bit = (f.payload >> (s_cfg.n_bits - 1u - i)) & 1u;
         s_bsrr[i] = bit ? (uint32_t)SSI_SLAVE_DATA_PIN
                         : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
+        s_ef[i] = 0u;              /* no-op: BSRR ignores a zero word */
     }
+    /* The (n+1)'th falling edge ends the Read Cycle, and by then the controller
+     * has sampled D0. Hand the line to the Error Flag there, from hardware, so
+     * it does not wait for an interrupt. */
+    s_ef[s_cfg.n_bits] = f.error_flag ? (uint32_t)SSI_SLAVE_DATA_PIN
+                                      : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
 #else
     /* MSB first: byte 0 carries D(n-1)..D(n-8). */
     for (uint8_t i = 0; i < s_nbytes; i++) {
@@ -249,7 +257,7 @@ static void ssi_arm(void)
      * watchdog seeing an idle count and nothing to resync. Mask UDE first, and
      * unmask only once the stream is loaded and enabled. */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-    CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
+    CLK_TIM->DIER &= ~(TIM_DIER_CC2DE | TIM_DIER_CC4DE);
     CLK_TIM->SR    = 0;
 
     SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
@@ -260,11 +268,19 @@ static void ssi_arm(void)
     SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
     SSI_DATA_DMA_STREAM->CR  |= DMA_SxCR_EN;
 
+    SSI_EF_DMA_STREAM->CR   &= ~DMA_SxCR_EN;
+    while (SSI_EF_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    DMA2->HIFCR = DMA_HIFCR_CTCIF7 | DMA_HIFCR_CHTIF7 | DMA_HIFCR_CTEIF7 |
+                  DMA_HIFCR_CDMEIF7 | DMA_HIFCR_CFEIF7;
+    SSI_EF_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_ef;
+    SSI_EF_DMA_STREAM->NDTR = (uint32_t)s_cfg.n_bits + 1u;
+    SSI_EF_DMA_STREAM->CR  |= DMA_SxCR_EN;
+
     /* The gap level is already on the pin; leave it there until the first
      * rising edge overwrites it with D(n-1). */
     CLK_TIM->CNT   = 0;
     CLK_TIM->SR    = 0;
-    CLK_TIM->DIER |= TIM_DIER_CC2DE;
+    CLK_TIM->DIER |= TIM_DIER_CC2DE | TIM_DIER_CC4DE;
     CLK_TIM->CR1  |= TIM_CR1_CEN;
     s_armed = true;
 }
@@ -535,7 +551,8 @@ static void clock_counter_init(void)
      * the same instant as the update event, but a compare event repeats where
      * the update event was measured to fire exactly once. */
     CLK_TIM->CCMR1 = TIM_CCMR1_CC1S_0;
-    CLK_TIM->CCR2  = 0u;
+    CLK_TIM->CCR2  = 0u;    /* counter at 0: a rising edge  -> next data bit */
+    CLK_TIM->CCR4  = 1u;    /* counter at 1: a falling edge -> Error Flag slot */
     CLK_TIM->SMCR  = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
                    | TIM_SMCR_TS_2;
 #else
@@ -550,7 +567,8 @@ static void clock_counter_init(void)
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
 #if defined(SIMENC_TIMER_DATA)
-    CLK_TIM->DIER = TIM_DIER_CC2DE;        /* one DMA request per rising edge */
+    CLK_TIM->DIER = TIM_DIER_CC2DE         /* one request per rising edge  */
+                  | TIM_DIER_CC4DE;        /* one request per falling edge */
 #else
     CLK_TIM->DIER = TIM_DIER_UIE;
 #endif
@@ -598,6 +616,17 @@ static void data_dma_init(void)
                              | DMA_SxCR_TCIE;            /* end of message */
     SSI_DATA_DMA_STREAM->FCR = 0;
 
+    /* Error Flag stream: same shape, no interrupt -- nothing needs to know. */
+    SSI_EF_DMA_STREAM->CR = 0;
+    while (SSI_EF_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    SSI_EF_DMA_STREAM->PAR = (uint32_t)(uintptr_t)SSI_DATA_BSRR;
+    SSI_EF_DMA_STREAM->CR  = (SSI_EF_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
+                           | DMA_SxCR_DIR_0
+                           | DMA_SxCR_MINC
+                           | DMA_SxCR_PSIZE_1 | DMA_SxCR_MSIZE_1
+                           | DMA_SxCR_PL_0 | DMA_SxCR_PL_1;
+    SSI_EF_DMA_STREAM->FCR = 0;
+
     HAL_NVIC_SetPriority(SSI_DATA_DMA_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(SSI_DATA_DMA_IRQn);
 }
@@ -610,11 +639,14 @@ void DMA2_Stream3_IRQHandler(void)
         /* Stop the request source in the same breath as ending the message, so
          * nothing can be raised during the gap that survives into the re-arm. */
         CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-        CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
+        CLK_TIM->DIER &= ~(TIM_DIER_CC2DE | TIM_DIER_CC4DE);
 
-        data_drive(s_gap_level);
-
+        /* The Error Flag is already on the line: the CC4 DMA put it there at
+         * the last falling edge. Driving it here is exactly the interrupt
+         * latency this replaced, and it is what made the gap open with a
+         * spurious HIGH pulse whenever D0 was 1. */
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+        SSI_EF_DMA_STREAM->CR   &= ~DMA_SxCR_EN;
         DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
         s_armed = false;
         s_frames++;
