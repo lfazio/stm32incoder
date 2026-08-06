@@ -33,8 +33,12 @@ def val(t,ch):
     return rows[i][1] if ch==0 else rows[i][2]
 
 T=(c[-1]-c[0])/(len(c)-1)                      # clock period, measured
-# Sample each bit in the middle of the low phase that follows its falling edge.
-bits=[val(t+T*0.25,1) for t in c]
+# Where in the bit cell to sample depends on which edge the encoder drives on.
+# Falling-edge builds set the bit at the falling edge; rising-edge builds set it
+# half a period later. Sampling a quarter period into the cell works for both,
+# so the offset is all that changes.
+RISING = (len(sys.argv) > 3 and sys.argv[3] == "rising")
+bits=[val(t + (T*0.75 if RISING else T*0.25), 1) for t in c]
 raw=0
 for b in bits: raw=(raw<<1)|b
 pv=(raw>>31)&1; zpd=(raw>>30)&1; pd=(raw>>11)&0x7FFFF; ts=raw&0x7FF
@@ -51,7 +55,9 @@ def X(t): return PAD+(W-PAD-RIGHT)*(t-tstart)/(tend-tstart)
 
 s=[]
 Y=64
-s.append(f'<text x="{PAD}" y="{Y-40}" class="ttl">One complete SSI4 Read Cycle at 500 kHz — the ordinary operating point</text>')
+s.append(f'<text x="{PAD}" y="{Y-40}" class="ttl">{"DATA on the rising edge (SIMENC_RISING_EDGE) — one Read Cycle at 500 kHz"
+              if RISING else
+              "One complete SSI4 Read Cycle at 500 kHz — the ordinary operating point"}</text>')
 s.append(f'<text x="{PAD}" y="{Y-24}" class="sub">32 clocks · T = {T*1e9:.0f} ns · decoded PV={pv} ZPD={zpd} PD={pd} TS={ts} · Tmu = {(tmu-c[-1])*1e6:.2f} us</text>')
 
 # Field bands over the bit cells: bit i occupies falling edge i .. i+1.
@@ -108,7 +114,9 @@ svg=f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="222" viewBox
 <rect width="100%" height="100%" fill="#ffffff"/>
 {chr(10).join(s)}
 <line x1="{PAD}" y1="206" x2="{PAD+22}" y2="206" class="rg"/>
-<text x="{PAD+28}" y="209" class="key">clock rising edges — one per bit; DATA should change on these and changes half a period early instead</text>
+<text x="{PAD+28}" y="209" class="key">{"clock rising edges — one per bit; DATA now changes on these, 8 ns after, as 5.4.1 note 2 requires"
+               if RISING else
+               "clock rising edges — one per bit; DATA should change on these and changes half a period early instead"}</text>
 </svg>'''
 open(out,"w").write(svg)
 print(f"wrote {out}  T={T*1e9:.1f}ns  raw={raw:08X} pv={pv} zpd={zpd} pd={pd} ts={ts}")

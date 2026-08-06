@@ -222,8 +222,18 @@ of a bit period. Cause: the Error Flag is driven by software in
 `end_of_message()`, so it inherits interrupt latency -- the same root cause as
 the edge deviation below.
 
-**Known deviation, unfixed: DATA changes on the falling edge and it should
-change on the rising edge.** POSITAL, RLS and IncOder 5.4.1 note 2 all say the
+**Fixed, opt-in:** `-DSIMENC_CLOCK_COUNTER=ON -DSIMENC_RISING_EDGE=ON` puts
+DATA on the rising edge. Analyser at 500 kHz: 3944 in-message transitions after
+a rising edge (median 8 ns) against 0 for the shipping build, whose 3760 all
+follow a falling edge. The 198 remaining falling-edge transitions are one per
+cycle -- the EXTI3 handover, which belongs there. 198/198 at 500 kHz, 1 MHz and
+2 MHz, resyncs=0. The handover margin at 2 MHz has NOT been re-measured on the
+analyser; do that before making it default. The loopback cannot confirm the edge
+-- the test master samples on the rising edge, so it now misreads the payload
+self-consistently. The Error Flag lateness is untouched by this.
+
+**Known deviation in the shipping default: DATA changes on the falling edge and
+it should change on the rising edge.** POSITAL, RLS and IncOder 5.4.1 note 2 all say the
 encoder sets each bit on the rising edge, with the controller reading it in the
 low phase that follows. We are half a clock period early, so a controller
 sampling on the falling edge reads the stream shifted by one bit.

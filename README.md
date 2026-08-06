@@ -294,7 +294,50 @@ The cause is that the Error Flag is driven by software, from
 anything. That is the same root cause as the deviation below, and it has the
 same fix: a data path driven by the SSI clock rather than by an ISR.
 
-### KNOWN DEVIATION — DATA changes on the falling edge, and it should not
+### FIXED, opt-in — DATA on the rising edge
+
+`-DSIMENC_CLOCK_COUNTER=ON -DSIMENC_RISING_EDGE=ON` puts every data bit on the
+rising clock edge, which is what 5.4.1 note 2 requires. Measured on the analyser
+at 500 kHz, counting DATA transitions inside the message:
+
+| Build | after a **rising** edge | after a **falling** edge |
+|---|---|---|
+| Shipping (SPI `CPOL=1`) | 0 | 3760, median 8 ns |
+| `SIMENC_RISING_EDGE` | **3944, median 8 ns** | 198, median 296 ns |
+
+The 198 falling-edge transitions are exactly one per cycle: the EXTI3 handover
+at the first falling edge, which belongs there — the pin must be under SPI
+control before rising edge 1.
+
+![One Read Cycle with DATA on the rising edge](docs/img/ssi4-500khz-rising.svg)
+
+Decoded straight off that capture: `PD=370085`, PV=1, ZPD=1 — the frame is
+correct on the wire with the bits on the specified edge.
+
+What unblocked it was the clock counter. `CPOL=0` needs `SPE` asserted only
+after the first falling edge, because the SSI clock idles HIGH and `CPOL=0`'s
+idle is LOW; arming against the wrong level was what produced an empty frame
+every second cycle. Deferring `SPE` costs the receive path one capture edge,
+and that count used to be end-of-message detection — with TIM3 counting the
+wire, nothing depends on it.
+
+Measured clean at every rate tried: 198/198 at 500 kHz, 1 MHz and 2 MHz, three
+runs each at the top two, `resyncs=0` throughout, 1600 frames. The extra `SPE`
+write lands in `EXTI3_IRQHandler`, the one path with a hard 250 ns deadline, and
+it still makes it — **but the handover margin itself has not been re-measured on
+the analyser, only inferred from clean bursts.** Do that before making this the
+default.
+
+The loopback cannot confirm the edge: the on-board test master samples on the
+rising edge, so with the slave now driving on that edge the master misreads the
+payload consistently — `pd=447186` at 500 kHz and 1 MHz, `485737` at 2 MHz,
+self-consistently, which is why the counts still read 198/198. The analyser is
+the authority here, and it says the wire is right.
+
+Not yet fixed by this: the Error Flag is still driven from an ISR and still
+arrives ~0.83 µs late.
+
+### The original deviation — DATA changes on the falling edge (shipping default)
 
 **The emulator drives each data bit half a clock period earlier than SSI
 specifies.** This is unfixed. If your controller samples on the falling edge —
