@@ -439,6 +439,32 @@ CLOCK (controller -> encoder)
   are *not* terminated with load resistors. Add 120 Ω at the receiving end only
   if you run a long pair.
 
+**Verified on the RS-422 link**, with both pairs running through the two
+modules, `fixed 0x5A5A5`, `burst 200 50` at each rate:
+
+| Master clock | Result | Payload |
+|---|---|---|
+| 100 kHz | 198/198 | correct |
+| 250 kHz | 198/198 | correct |
+| 500 kHz | 198/198 | correct |
+| 1.0 MHz | 198/198 | correct |
+| 1.5 MHz | 194–197 / 200 | correct |
+| 2.0 MHz | 196–198 / 200 | shifted one bit — see below |
+
+`resyncs=0` throughout, and all five variants are clean at 500 kHz (98/98 each
+for SSI1, SSI2, SSI4, SSI6, SSI9). The two top rates scatter by half to two per
+cent run to run, but they scatter by the same amount over the plain TTL jumpers
+measured the same afternoon, so that is the 2 MHz corner's own margin rather
+than anything the transceivers introduce.
+
+The one-bit shift at 2 MHz — the test master decodes PD as 447186 =
+`(0x5A5A5 >> 1) | 0x40000` instead of 370085, consistently, which is why the
+count still reads 198/198 — is the on-board master sampling, not the wire. The
+logic analyser decodes the same frames correctly at 2 MHz. It is the KNOWN
+DEVIATION above seen from the receiving end: master and slave are both a half
+period out, in the same direction, which cancels below ~1 MHz and stops
+cancelling as the period approaches the sampling delay.
+
 ## Measured against the specification
 
 Captured with a Saleae Logic Pro 16 at 125 MS/s (8 ns resolution), 3.3 V

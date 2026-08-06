@@ -260,7 +260,13 @@ where a hard deadline makes the tail matter. The end-of-frame path is
 compensated and has ~10x margin, so its mean is what counts. The test master
 needs nothing -- its clock is TIM1 compare events driving DMA.
 
-Still to do: the same run through two MAX490 modules at RS-422.
+Done at RS-422 through two MAX490 modules: the whole 100 kHz..2 MHz sweep with
+`resyncs=0`, and all five variants clean at 500 kHz. 100 kHz..1 MHz are perfect
+(198/198); 1.5 and 2 MHz scatter 0.5-2% run to run, the same as they do over
+plain TTL jumpers, so that is the corner's own margin and not the transceivers.
+At 2 MHz the test master decodes PD shifted one bit -- `(pd >> 1) | 0x40000` --
+while the analyser decodes the same frames correctly, so it is the master's
+sampling, not the wire: the KNOWN DEVIATION seen from the receiving end.
 
 Run `wire` before trusting any `read`; `FFFFFFFF` with `frames=0` means a jumper
 is missing. Note the first `read` immediately after `wire` can return a bad frame
