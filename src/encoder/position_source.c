@@ -7,9 +7,27 @@
  * 10 kHz (100 us), the fastest rate that still satisfies "< 0.1 ms". */
 #define UPDATE_RATE_HZ   10000u
 
-/* ADC noise smoothing. Averaging N samples costs N x 100 us of lag; 4 keeps
- * the lag (400 us) well inside a typical SSI polling interval. */
-#define ADC_AVG_SAMPLES  4u
+/* Oversampling.
+ *
+ * The ADC free-runs and DMA writes into this circular buffer; each position
+ * update averages the whole buffer. Sized so the buffer spans one update
+ * period, so an update averages the conversions taken *during* that period.
+ *
+ * It used to be four samples taken at the update rate itself, which meant each
+ * update was a moving average over the previous 400 us -- four update periods.
+ * The Time Stamp claims to say when the position was measured, and a 400 us
+ * smear makes that claim false.
+ *
+ * fADC = PCLK2/8 = 11.25 MHz and a 12-bit conversion takes 84 sampling + 12
+ * conversion cycles = 96, so 8.53 us each, and 12 of them span 102 us against
+ * the 100 us update period. 12x oversampling is worth about 1.8 bits of noise
+ * averaging (sqrt 12).
+ *
+ * Pushing this further means a faster ADC clock and shorter sampling, which
+ * costs bus bandwidth -- and the EXTI3 handover has only 26 ns of margin and
+ * was measured to be bus-contention sensitive, not flash-fetch sensitive. Do
+ * not raise it without re-measuring the handover on the analyser. */
+#define ADC_AVG_SAMPLES  12u
 
 /* ADC1 -> DMA2 Stream 0, channel 0 (RM0390 Rev 9 Table 29). Stream 4 carries
  * the same request; streams 2/3 are taken by SPI1. */
@@ -48,7 +66,9 @@ static void tim_init(void)
 {
     __HAL_RCC_TIM2_CLK_ENABLE();
 
-    /* TIM2 sits on APB1; with the APB1 prescaler != 1 its clock is 90 MHz. */
+    /* TIM2 sits on APB1; with the APB1 prescaler != 1 its clock is 90 MHz.
+     * It no longer triggers the ADC -- that free-runs now -- but it still
+     * paces the position update at the rate 4.12 specifies. */
     s_tim.Instance               = TIM2;
     s_tim.Init.Prescaler         = (APB1_TIMCLK_HZ / 1000000u) - 1u;  /* 1 MHz */
     s_tim.Init.CounterMode       = TIM_COUNTERMODE_UP;
@@ -89,11 +109,13 @@ static void adc_init(void)
     s_adc.Init.DataAlign             = ADC_DATAALIGN_RIGHT;
     s_adc.Init.ScanConvMode          = DISABLE;
     s_adc.Init.EOCSelection          = ADC_EOC_SINGLE_CONV;
-    s_adc.Init.ContinuousConvMode    = DISABLE;
+    /* Free-running rather than triggered at the update rate: the point is to
+     * take many conversions inside each update period, not one. */
+    s_adc.Init.ContinuousConvMode    = ENABLE;
     s_adc.Init.DiscontinuousConvMode = DISABLE;
     s_adc.Init.NbrOfConversion       = 1;
-    s_adc.Init.ExternalTrigConv      = ADC_EXTERNALTRIGCONV_T2_TRGO;
-    s_adc.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_RISING;
+    s_adc.Init.ExternalTrigConv      = ADC_SOFTWARE_START;
+    s_adc.Init.ExternalTrigConvEdge  = ADC_EXTERNALTRIGCONVEDGE_NONE;
     s_adc.Init.DMAContinuousRequests = ENABLE;
     HAL_ADC_Init(&s_adc);
 

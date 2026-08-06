@@ -277,6 +277,50 @@ went from `ok=198 bad=0` to `ok=7 bad=191` if `wire` had run first. With the
 reset it is `ok=198 bad=0` either way, and the first Read Cycle after `wire` —
 which used to be reliably wrong — now decodes correctly too.
 
+### DATA changes on the falling edge — but the first bit looks different
+
+Scoping the link can suggest DATA toggles on the *rising* edge. Measured over a
+2 MHz capture, it does not:
+
+| | delay after the falling edge | as a fraction of T |
+|---|---|---|
+| bits 1…31 | **10 ns** | 2 % |
+| bit 0 (D31) | **209 ns** | 41 % |
+
+Zero of 6157 later-bit transitions occurred after a rising edge. The steady-state
+behaviour is the standard SSI relationship — DATA changes on the falling edge,
+the controller samples on the rising edge — which is also what makes §5.4.1
+note 3 coherent: the line can only be "set by the Error Flag after the last
+rising edge" if the data bits were already changing on the falling edges.
+
+The **first** bit is the exception, and it is the EXTI3 handover: DATA is held
+HIGH by GPIO until the master's first falling edge, so D31 appears ~209 ns late.
+At 2 MHz that is 41 % of the way to the rising edge, which on a scope reads as
+"toggling at the clock edge". It still meets setup time, with the ~26 ns margin
+measured in "Critical path in SRAM", and the fraction shrinks at lower clock
+rates — at 500 kHz the same 209 ns is 10 % of a period.
+
+### Oversampling and the update rate
+
+Two rates, easily conflated, and the guide fixes both:
+
+- **Position latch: 10 kHz.** §4.12 gives "Internal Position Update Period
+  < 0.1 millisecond", and §5.5.1 pins the value by describing ASI2 frames as
+  "transmitted at a rate of 10kHz nominal (*same rate as Internal Position
+  Update Period*)". So 100 µs is the specified rate, not a floor to beat.
+- **Time Stamp tick: 10 µs**, i.e. a 100 kHz counter spanning 0.00…20.47 ms
+  (§5.4.2). That 100 kHz is the *counter*, not the latch.
+
+The emulator has always latched at 10 kHz and ticked TS at 100 kHz, which is
+correct. What was wrong is what the latch averaged: four ADC samples taken *at*
+the update rate, so every position was a moving average over the previous
+400 µs — four update periods. TS claims to record when the position was
+measured, and a 400 µs smear makes that claim false.
+
+The ADC now free-runs and each update averages the 12 conversions taken during
+that period (12 × 8.53 µs = 102 µs against the 100 µs period), which is both
+genuinely per-period and worth about 1.8 bits of noise averaging.
+
 ### One-cycle data latency is intentional
 
 A value changed between Read Cycles appears in the *next* frame, not the current

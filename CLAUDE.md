@@ -207,6 +207,18 @@ the worst-case margin from 7.2% to 10.4%. Re-measure with -DSIMENC_RAMFUNC=OFF
 before changing anything here; roughly 200 ns of the budget is interrupt entry
 and EXTI propagation, not the three-register handler body.
 
+Two rates that are easy to conflate, both fixed by the guide: the **position
+latch is 10 kHz** (4.12 says "< 0.1 ms", and 5.5.1 pins it by calling ASI2's
+10 kHz "the same rate as Internal Position Update Period"), while the **Time
+Stamp counter ticks at 100 kHz**, 10 us resolution (5.4.2). 100 kHz is the
+counter, not the latch -- do not "fix" the update rate to 100 kHz.
+
+DATA changes on the **falling** edge; measured, bits 1..31 transition 10 ns
+after it and none after a rising edge. Only bit 0 is late, ~209 ns, because
+EXTI3 hands the pin over on the first falling edge -- at 2 MHz that is 41% of a
+period and on a scope looks like it toggles at the clock edge. That is expected,
+not a defect.
+
 The Tmu correction is dynamic. Do not replace it with a constant: the
 half-clock-period term ranges from 0.25 us at 2 MHz to 5 us at 100 kHz, and a
 constant tuned at one end puts the other outside the 20 us +/- 1 us window. T is
