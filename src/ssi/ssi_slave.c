@@ -39,6 +39,42 @@
 #define SSI_TX_CLEAR_FLAGS (DMA_LIFCR_CTCIF3 | DMA_LIFCR_CHTIF3 | DMA_LIFCR_CTEIF3 | \
                             DMA_LIFCR_CDMEIF3 | DMA_LIFCR_CFEIF3)
 
+/* End of message: counted clocks, or counted received bytes.
+ *
+ * By default the receive DMA's transfer-complete event marks end of message --
+ * it counts clock edges for us, since every capture edge moves a bit. That is
+ * free but it ties the frame length to whole bytes, and it ties end-of-message
+ * detection to the SPI's own capture edge. Both are limits worth removing:
+ *
+ *   - SSI7 (n=30) and SSI8 (n=18) are not byte aligned, so the byte count
+ *     cannot express them at all.
+ *   - The clock-edge fix (see the README's KNOWN DEVIATION) needs SPE asserted
+ *     only after the first falling edge, which costs the receive path one
+ *     capture edge -- n-1 instead of n -- and that count is exactly what this
+ *     detection uses.
+ *
+ * SIMENC_CLOCK_COUNTER moves the job to TIM3, counting clock edges on ETR with
+ * ARR = n-1 so its update event lands on the nth. That counts the wire, not the
+ * SPI, so it is indifferent to both.
+ *
+ * It fires on the last *rising* edge, where the receive DMA fires today, not
+ * the last falling edge -- even though the falling edge is the reference Tmu is
+ * specified from and ending there would delete the half-period correction
+ * entirely. In the shipping CPOL=1 configuration the last data bit D0 is only
+ * driven at that last falling edge, so reclaiming the line there would truncate
+ * it. Same instant, same correction, different detector: that is the whole
+ * intended change. Moving the reference is a separate step, and it only becomes
+ * correct once DATA moves to the rising edge.
+ *
+ * NOT VALIDATED ON HARDWARE -- it needs a wire that the bench does not have
+ * yet (see SSI_ETR_PIN), and without it the counter never counts and the link
+ * stops dead. Hence opt-in, and hence the default is unchanged.
+ */
+#if defined(SIMENC_CLOCK_COUNTER)
+#define CLK_TIM         SSI_ETR_TIM
+#define CLK_TIM_IRQn    SSI_ETR_TIM_IRQn
+#endif
+
 /* Tmu gap timer, TIM6, a basic timer on APB1 (90 MHz with the APB1 prescaler
  * != 1). The gap it times is corrected for two things, because it does not
  * start at the reference the specification uses -- see the half-period note by
@@ -90,6 +126,13 @@ static volatile uint32_t     s_moder_af;
  * before transfer-complete, and both run in non-critical handlers, so the two
  * cycle counts give T for free:  T = (t_TC - t_HT) / (n_bits/2).
  */
+#if defined(SIMENC_CLOCK_COUNTER)
+/* Sticky: ETR has counted at least one edge since boot. The wire this needs is
+ * easy to leave off, and without it the symptom is a dead link with no clue
+ * attached, so `stat` reports this rather than making it a puzzle. */
+static volatile bool         s_clk_counted;
+#endif
+
 static volatile uint32_t     s_t_half;         /* DWT cycles at half transfer */
 static volatile uint32_t     s_ht_bits;        /* bits already clocked in at that point */
 static volatile uint32_t     s_period_ns;      /* measured clock period T */
@@ -149,6 +192,9 @@ static void stage_frame(void)
 
 static inline void spi_configure(void);
 static inline void spi_reset(void);
+#if defined(SIMENC_CLOCK_COUNTER)
+static inline void clock_counter_arm(void);
+#endif
 
 static void ssi_arm(void)
 {
@@ -173,6 +219,10 @@ static void ssi_arm(void)
 
     SSI_RX_STREAM->CR |= DMA_SxCR_EN;
     SSI_TX_STREAM->CR |= DMA_SxCR_EN;
+
+#if defined(SIMENC_CLOCK_COUNTER)
+    clock_counter_arm();
+#endif
 
     SSI_SLAVE_SPI->CR1 |= SPI_CR1_SPE;
 
@@ -304,12 +354,71 @@ static void dma_init(void)
     SSI_RX_STREAM->CR  = (SSI_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
                        | DMA_SxCR_MINC
                        | DMA_SxCR_PL_0 | DMA_SxCR_PL_1  /* very high */
-                       | DMA_SxCR_TCIE | DMA_SxCR_HTIE;
+#if !defined(SIMENC_CLOCK_COUNTER)
+                       | DMA_SxCR_TCIE        /* end of message */
+#endif
+                       | DMA_SxCR_HTIE;       /* always: measures T */
     SSI_RX_STREAM->FCR = 0;
 
     HAL_NVIC_SetPriority(SSI_RX_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(SSI_RX_IRQn);
 }
+
+#if defined(SIMENC_CLOCK_COUNTER)
+/* TIM3 counting SSI clock edges on ETR, so that end of message is the nth
+ * edge on the wire rather than the nth byte through the SPI. */
+static void clock_counter_init(void)
+{
+    GPIO_InitTypeDef io = {0};
+
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+
+    /* Pull up to match the SSI idle level, so a missing wire idles high rather
+     * than floating and counting noise. It still will not count -- that is the
+     * point of the check in ssi_slave_clock_counter_ok(). */
+    io.Pin       = SSI_ETR_PIN;
+    io.Mode      = GPIO_MODE_AF_PP;
+    io.Pull      = GPIO_PULLUP;
+    io.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    io.Alternate = SSI_ETR_AF;
+    HAL_GPIO_Init(SSI_ETR_GPIO, &io);
+
+    __HAL_RCC_TIM3_CLK_ENABLE();
+
+    CLK_TIM->CR1 = 0;
+    CLK_TIM->PSC = 0;                      /* count every edge, not every Nth */
+    CLK_TIM->ARR = (uint32_t)s_cfg.n_bits - 1u;
+
+    /* External clock mode 2 (RM0390 17.3.12): ECE=1 clocks the counter from
+     * ETRF. ETP=0 counts rising edges, which is where the receive DMA completes
+     * today. No ETR prescaler and no filter: the filter samples ETR over
+     * several clocks and would delay the update event, and the gap this event
+     * starts is what has to land inside 20 us +/- 1 us. */
+    CLK_TIM->SMCR = TIM_SMCR_ECE;
+
+    CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
+    CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
+    CLK_TIM->DIER = TIM_DIER_UIE;
+
+    /* Same priority as the receive DMA's end-of-message interrupt it replaces:
+     * above everything except the EXTI3 handover, which it must never preempt
+     * -- equal preemption priority, higher subpriority. */
+    HAL_NVIC_SetPriority(CLK_TIM_IRQn, 0, 1);
+    HAL_NVIC_EnableIRQ(CLK_TIM_IRQn);
+}
+
+/* Restarts the count for one message. The counter must be zeroed rather than
+ * left to free-run: anything that toggles the clock pin between messages --
+ * the loopback continuity test, above all -- would otherwise carry a count
+ * into the next frame and end it early. */
+static inline void clock_counter_arm(void)
+{
+    CLK_TIM->CR1 &= ~TIM_CR1_CEN;
+    CLK_TIM->CNT  = 0;
+    CLK_TIM->SR   = 0;
+    CLK_TIM->CR1 |= TIM_CR1_CEN;
+}
+#endif /* SIMENC_CLOCK_COUNTER */
 
 static void gap_timer_init(void)
 {
@@ -372,6 +481,9 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     gpio_init();
     spi_init();
     dma_init();
+#if defined(SIMENC_CLOCK_COUNTER)
+    clock_counter_init();
+#endif
     gap_timer_init();
     return true;
 }
@@ -398,6 +510,12 @@ bool ssi_slave_set_frame_bits(uint8_t n_bits)
 
     s_cfg.n_bits = n_bits;
     s_nbytes     = (uint8_t)(n_bits / 8u);
+#if defined(SIMENC_CLOCK_COUNTER)
+    CLK_TIM->CR1 &= ~TIM_CR1_CEN;
+    CLK_TIM->ARR  = (uint32_t)n_bits - 1u;
+    CLK_TIM->EGR  = TIM_EGR_UG;
+    CLK_TIM->SR   = 0;
+#endif
 
     ssi_slave_start();
     return true;
@@ -414,6 +532,12 @@ void ssi_slave_poll(void)
      * stopped clocking mid-message, which would leave the byte framing skewed
      * for every later cycle -- so drop it and re-arm. */
     uint16_t ndtr = (uint16_t)SSI_RX_STREAM->NDTR;
+
+#if defined(SIMENC_CLOCK_COUNTER)
+    if (CLK_TIM->CNT != 0u) {
+        s_clk_counted = true;
+    }
+#endif
 
     if (ndtr != s_nbytes && ndtr == s_last_ndtr) {
         s_resyncs++;
@@ -456,10 +580,56 @@ SSI_RAMFUNC void EXTI3_IRQHandler(void)
     EXTI->PR   = SSI_SLAVE_SCK_PIN;
 }
 
-/* End of message: the receive DMA has counted all n clocks. */
+/* End of message, whichever detector saw it: all n clocks have been counted.
+ * Both callers run at the same instant -- the last rising edge -- so the gap
+ * correction below is the same either way. */
+static void end_of_message(void)
+{
+    /* Read the cycle counter before anything else, in particular before the
+     * APB write that clears the DMA flags: that write can stall, and folding
+     * the stall into the measured interval inflates T, which shortens the gap
+     * by half the error. */
+    uint32_t elapsed = DWT->CYCCNT - s_t_half;
+
+    DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;
+
+    /* The interval spans however many clocks remained after the half-transfer
+     * event, which s_ht_bits records exactly. Guard against a wildly
+     * out-of-range value from an aborted cycle before trusting it. */
+    uint32_t span = (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits)
+                  ? (uint32_t)(s_cfg.n_bits - s_ht_bits)
+                  : (uint32_t)(s_cfg.n_bits / 2u);
+    /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- doing it
+     * the other way truncates to 5 and reports every period 10% short.
+     * Worst case 16 periods at 100 kHz is 288000 cycles, so x1000 still
+     * fits comfortably in 32 bits. */
+    uint32_t per_ns = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
+    if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
+        s_period_ns    = per_ns;
+        s_period_valid = true;
+    }
+
+    /* Take the line back and present the Error Flag for the gap. */
+    data_drive(s_gap_level);
+    data_take_gpio();
+
+    SSI_SLAVE_SPI->CR1 &= ~SPI_CR1_SPE;
+    SSI_TX_STREAM->CR  &= ~DMA_SxCR_EN;
+    SSI_RX_STREAM->CR  &= ~DMA_SxCR_EN;
+
+    s_armed = false;
+    s_frames++;
+
+    gap_timer_start();
+}
+
+/* The receive DMA. It always provides the half-transfer timestamp that gives
+ * the measured clock period T; it marks end of message only when the clock
+ * counter is not built in, in which case its TC interrupt is not even enabled
+ * and TIM3 owns that job. */
 void DMA2_Stream2_IRQHandler(void)
 {
-    /* Half transfer: n_bits/2 clocks still to come. Timestamp only. */
+    /* Half transfer: the rest of the clocks are still to come. Timestamp only. */
     if (DMA2->LISR & DMA_LISR_HTIF2) {
         DMA2->LIFCR = DMA_LIFCR_CHTIF2;
         s_t_half = DWT->CYCCNT;
@@ -471,44 +641,32 @@ void DMA2_Stream2_IRQHandler(void)
     }
 
     if (DMA2->LISR & DMA_LISR_TCIF2) {
-        uint32_t elapsed = DWT->CYCCNT - s_t_half;
-
-        DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;
-
-        /* elapsed spans exactly n_bits/2 clock periods (half transfer to
-         * transfer complete). Guard against a wildly out-of-range value from
-         * an aborted cycle before trusting it. */
-        /* The interval spans however many clocks remained after the
-         * half-transfer event, which s_ht_bits records exactly. */
-        uint32_t span = (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits)
-                      ? (uint32_t)(s_cfg.n_bits - s_ht_bits)
-                      : (uint32_t)(s_cfg.n_bits / 2u);
-        /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- doing it
-         * the other way truncates to 5 and reports every period 10% short.
-         * Worst case 16 periods at 100 kHz is 288000 cycles, so x1000 still
-         * fits comfortably in 32 bits. */
-        uint32_t per_ns   = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
-        if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
-            s_period_ns    = per_ns;
-            s_period_valid = true;
-        }
-
-        /* Take the line back and present the Error Flag for the gap. */
-        data_drive(s_gap_level);
-        data_take_gpio();
-
-        SSI_SLAVE_SPI->CR1 &= ~SPI_CR1_SPE;
-        SSI_TX_STREAM->CR  &= ~DMA_SxCR_EN;
-        SSI_RX_STREAM->CR  &= ~DMA_SxCR_EN;
-
-        s_armed = false;
-        s_frames++;
-
-        gap_timer_start();
+#if defined(SIMENC_CLOCK_COUNTER)
+        DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;   /* TIM3 ends the message, not this */
+#else
+        end_of_message();                   /* clears the flags itself */
+#endif
     } else {
         DMA2->LIFCR = SSI_RX_CLEAR_FLAGS;
     }
 }
+
+#if defined(SIMENC_CLOCK_COUNTER)
+/* End of message: TIM3 has counted the nth clock edge on the wire. */
+void TIM3_IRQHandler(void)
+{
+    if (CLK_TIM->SR & TIM_SR_UIF) {
+        CLK_TIM->SR   = 0;
+        CLK_TIM->CR1 &= ~TIM_CR1_CEN;
+        end_of_message();
+    }
+}
+
+bool ssi_slave_clock_counter_ok(void)
+{
+    return s_clk_counted;
+}
+#endif
 
 /* Tmu elapsed: latest position data is now available, DATA returns HIGH and a
  * new Read Cycle may start. */

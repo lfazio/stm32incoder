@@ -345,6 +345,32 @@ free — only TIM1, TIM2, TIM6 and TIM7 are in use.
 Until that wire exists the change cannot be validated: without it the counter
 never counts and the link stops dead.
 
+**It is written and builds, behind `-DSIMENC_CLOCK_COUNTER=ON`, default OFF.**
+TIM3 runs in external clock mode 2 with `ARR = n-1`, and its update event ends
+the message; the receive DMA keeps its half-transfer interrupt, which is what
+measures `T`, but no longer its transfer-complete one. `stat` gains a line
+reporting whether ETR has seen any edge at all, so a forgotten jumper names
+itself instead of presenting as a dead link:
+
+```
+eom=clock-counter etr=NO EDGES - check PD2/CN7-4
+```
+
+It fires on the last **rising** edge, where the receive DMA fires today —
+deliberately not the last falling edge, tempting though that is, since ending
+there would make the reference the one Tmu is actually specified from and delete
+the half-period correction entirely. In the shipping `CPOL=1` configuration the
+last data bit D0 is only driven at that final falling edge, so reclaiming the
+line there would truncate it. Same instant, same correction, different detector
+— that is the whole of the intended change. Moving the reference is a separate
+step, and it only becomes correct once DATA has moved to the rising edge.
+
+**Not hardware-validated**, for want of the wire. What has been checked is that
+both configurations build clean, that `TIM3_IRQHandler` is really linked rather
+than silently bound to `Default_Handler`, and that the default build is
+unchanged in behaviour on the bench — 4×200 cycles at 2 MHz and every variant at
+100 kHz, all `bad=0`, `resyncs=0`.
+
 Until then, the emulator interoperates with a controller that samples on the
 **rising** edge, which is what the on-board test master does — so the loopback
 results elsewhere in this document are self-consistent but do not prove

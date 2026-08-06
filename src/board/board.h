@@ -53,6 +53,23 @@
 /* Bit position of PB4 inside GPIOB->MODER (2 bits per pin). */
 #define SSI_SLAVE_DATA_PIN_NUM   4u
 
+/* End-of-message clock counter -- only built when SIMENC_CLOCK_COUNTER is on.
+ *
+ * TIM3 in external clock mode 2 counts SSI clock edges on its ETR input and
+ * raises an update event on the nth, which is end of message for any n,
+ * byte aligned or not, and independent of what the SPI is doing with the bits.
+ *
+ * ETR has to be a second pad: PB3 already carries SPI1_SCK on AF5, and a pad
+ * holds one alternate function at a time (its AF1 is TIM2_CH2, no use here).
+ * PD2 is TIM3_ETR on AF2 [DS Table 11] and comes out on morpho CN7 pin 4
+ * [UM Table 29], so the clock net needs a second wire to it.
+ */
+#define SSI_ETR_TIM              TIM3
+#define SSI_ETR_TIM_IRQn         TIM3_IRQn
+#define SSI_ETR_GPIO             GPIOD
+#define SSI_ETR_PIN              GPIO_PIN_2
+#define SSI_ETR_AF               GPIO_AF2_TIM3
+
 #define SSI_MASTER_SPI           SPI2
 #define SSI_MASTER_SCK_GPIO      GPIOB
 #define SSI_MASTER_SCK_PIN       GPIO_PIN_10

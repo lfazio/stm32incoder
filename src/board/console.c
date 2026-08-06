@@ -172,6 +172,12 @@ static void cmd_stat(void)
     trace_printf("data_line_idle_high=%u  measured_T=%luns\r\n",
                  (unsigned)ssi_master_data_idle_high(),
                  (unsigned long)ss.period_ns);
+#if defined(SIMENC_CLOCK_COUNTER)
+    /* Names the missing wire rather than leaving a dead link unexplained. */
+    trace_printf("eom=clock-counter etr=%s\r\n",
+                 ssi_slave_clock_counter_ok() ? "counting"
+                                              : "NO EDGES - check PD2/CN7-4");
+#endif
 }
 
 static void cmd_read(uint32_t count, bool fast)

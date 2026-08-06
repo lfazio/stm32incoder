@@ -37,6 +37,15 @@ set_property(CACHE SIMENC_CLOCK_SOURCE PROPERTY STRINGS AUTO HSE HSI)
 # it halves the jitter, which is what a hard deadline cares about.
 option(SIMENC_RAMFUNC "Run the critical SSI handlers from SRAM" ON)
 
+# End of message from a hardware clock counter (TIM3 external clock on ETR)
+# rather than from the receive DMA's byte count. Removes the byte-alignment
+# constraint that keeps SSI7/SSI8 out, and unblocks the clock-edge fix.
+#
+# OFF by default and NOT hardware-validated: it needs the SSI clock wired to
+# PD2 (TIM3_ETR, morpho CN7-4) as well as PB3, and without that wire the
+# counter never counts and the link goes dead. See the README.
+option(SIMENC_CLOCK_COUNTER "End of message from a TIM3 clock counter" OFF)
+
 set(HAL_MODULES
     hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr
     hal_pwr_ex hal_flash hal_flash_ex hal_flash_ramfunc hal_adc hal_adc_ex
@@ -75,6 +84,7 @@ target_compile_definitions(simenc.elf PRIVATE
     USE_HAL_DRIVER
     SIMENC_CLOCK_SOURCE_${SIMENC_CLOCK_SOURCE}=1
     $<$<BOOL:${SIMENC_RAMFUNC}>:SIMENC_RAMFUNC=1>
+    $<$<BOOL:${SIMENC_CLOCK_COUNTER}>:SIMENC_CLOCK_COUNTER=1>
 )
 
 target_compile_options(simenc.elf PRIVATE
