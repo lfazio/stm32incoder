@@ -175,8 +175,8 @@ static void cmd_stat(void)
 #if defined(SIMENC_CLOCK_COUNTER)
     /* Names the missing wire rather than leaving a dead link unexplained. */
     trace_printf("eom=clock-counter etr=%s\r\n",
-                 ssi_slave_clock_counter_ok() ? "counting"
-                                              : "NO EDGES - check PD2/CN7-4");
+                 ssi_slave_clock_counter_ok() ? "counted n"
+                                              : "NEVER REACHED n - check PD2");
 #endif
 }
 

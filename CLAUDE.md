@@ -237,6 +237,20 @@ end-of-message uses.
 So the fix needs end-of-message detection that does not depend on the RX byte
 count -- the same hardware clock counter SSI7/SSI8 need. Do these together.
 
+That counter now exists: `-DSIMENC_CLOCK_COUNTER=ON` (default OFF) ends the
+message from TIM3 counting clock edges on ETR, `ARR = n-1`. It needs the clock
+wired to **PD2** (TIM3_ETR AF2, morpho CN7-4) as well as PB3 -- one pad carries
+one AF, and PB3's is already SPI1_SCK. Verified on hardware over RS-422: every
+rate 100 kHz..2 MHz decodes, `resyncs=0`, and at 2 MHz it is indistinguishable
+from the receive-DMA path. **Unexplained: at 1.5 MHz it is about twice as lossy**
+(4..9 bad per 200 against 1..4), consistent over five runs, which is why it is
+still off by default. Both rates are exact divisors of 180 MHz, and both paths
+are worse at 1.5 MHz than at 2 MHz.
+
+Do not test the ETR wire by asking whether the counter has seen an edge: a
+floating PD2 picks up enough noise to answer yes while the link stays dead.
+Ask whether it reached n -- i.e. whether the update event ever fired.
+
 Note the loopback proves nothing about this: the on-board test master samples on
 the rising edge, matching our own bug.
 

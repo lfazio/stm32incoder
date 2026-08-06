@@ -345,7 +345,8 @@ free — only TIM1, TIM2, TIM6 and TIM7 are in use.
 Until that wire exists the change cannot be validated: without it the counter
 never counts and the link stops dead.
 
-**It is written and builds, behind `-DSIMENC_CLOCK_COUNTER=ON`, default OFF.**
+**It is implemented and now verified on hardware, behind
+`-DSIMENC_CLOCK_COUNTER=ON`, default OFF.**
 TIM3 runs in external clock mode 2 with `ARR = n-1`, and its update event ends
 the message; the receive DMA keeps its half-transfer interrupt, which is what
 measures `T`, but no longer its transfer-complete one. `stat` gains a line
@@ -365,11 +366,29 @@ line there would truncate it. Same instant, same correction, different detector
 — that is the whole of the intended change. Moving the reference is a separate
 step, and it only becomes correct once DATA has moved to the rising edge.
 
-**Not hardware-validated**, for want of the wire. What has been checked is that
-both configurations build clean, that `TIM3_IRQHandler` is really linked rather
-than silently bound to `Default_Handler`, and that the default build is
-unchanged in behaviour on the bench — 4×200 cycles at 2 MHz and every variant at
-100 kHz, all `bad=0`, `resyncs=0`.
+**Measured with the wire fitted**, over RS-422, `fixed 0x5A5A5`, `burst 200 50`,
+against the shipping receive-DMA path on the same bench the same afternoon —
+bad frames per 200, so lower is better:
+
+| Master clock | receive DMA (shipping) | clock counter |
+|---|---|---|
+| 100 kHz – 1 MHz | 0 | 0 |
+| 1.5 MHz | 1, 3, 4 | **4, 4, 6, 7, 9** |
+| 2 MHz | 1, 1, 2 | 0, 1, 1, 2, 2 |
+
+It works: `frames` advances, `resyncs=0`, the measured period tracks, and every
+rate from 100 kHz to 2 MHz decodes. At 2 MHz the two paths are indistinguishable.
+
+**At 1.5 MHz the counter is about twice as lossy**, and that is unexplained.
+It is not a small effect and it is consistent across five runs, so it is
+recorded rather than rounded away. Two things make it odd: it is worse at
+1.5 MHz than at 2 MHz, for both paths, and 1.5 MHz is an exact divisor
+(180/120) just as 2 MHz is (180/90). Until that is understood the option stays
+off by default.
+
+Also checked: both configurations build clean, `TIM3_IRQHandler` is really
+linked rather than silently bound to `Default_Handler`, and the default build is
+unchanged on the bench — 4×200 cycles at 2 MHz and every variant, all `bad=0`.
 
 Until then, the emulator interoperates with a controller that samples on the
 **rising** edge, which is what the on-board test master does — so the loopback
@@ -478,6 +497,12 @@ history has since been rewritten twice, which made the hash dangle. The build
 configuration is the durable reference.)
 
 ![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
+
+The faint vertical rules mark every **clock rising edge** — the edges the
+specification says each data bit should be set on. DATA transitions land
+between them, on the falling edges, which is the KNOWN DEVIATION above shown
+directly. The green rule is the first falling edge, which starts the Read Cycle
+and triggers the EXTI3 handover.
 
 | Property | Specified | Measured (200 Read Cycles) |
 |---|---|---|

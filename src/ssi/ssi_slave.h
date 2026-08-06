@@ -71,11 +71,13 @@ void ssi_slave_poll(void);
 void ssi_slave_get_stats(ssi_slave_stats_t *out);
 
 #if defined(SIMENC_CLOCK_COUNTER)
-/* True once the external clock counter has seen an edge. It counts the clock
- * on a second pad (TIM3_ETR, PD2 / CN7-4), and if that wire is missing the
- * counter never reaches n, no message ever ends and the link is simply dead --
- * a symptom with nothing pointing at its cause. `stat` reports this so the
- * missing wire names itself. */
+/* True once the external clock counter has actually reached n and ended a
+ * message. It counts the clock on a second pad (TIM3_ETR, PD2 / CN7-4), and if
+ * that wire is missing the counter never reaches n, no message ever ends and
+ * the link is simply dead -- a symptom with nothing pointing at its cause.
+ * `stat` reports this so the missing wire names itself. Reaching n is the
+ * property worth reporting: a floating input picks up enough noise to make
+ * "saw an edge" true while the link stays dead. */
 bool ssi_slave_clock_counter_ok(void);
 #endif
 

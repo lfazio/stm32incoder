@@ -127,9 +127,14 @@ static volatile uint32_t     s_moder_af;
  * cycle counts give T for free:  T = (t_TC - t_HT) / (n_bits/2).
  */
 #if defined(SIMENC_CLOCK_COUNTER)
-/* Sticky: ETR has counted at least one edge since boot. The wire this needs is
- * easy to leave off, and without it the symptom is a dead link with no clue
- * attached, so `stat` reports this rather than making it a puzzle. */
+/* Sticky: the counter has actually reached n and ended a message. Set from the
+ * update handler, which is the only thing that proves it -- an earlier version
+ * polled CNT != 0 instead and was wrong in both directions. It read "counting"
+ * off 11 counts of noise on a floating input that never reached n, and once the
+ * wire was on it read "no edges", because every re-arm resets CNT to 0 and the
+ * poll almost never lands mid-message. The wire this needs is easy to leave
+ * off, and without it the link is simply dead with nothing pointing at the
+ * cause, so `stat` has to answer the question rather than approximate it. */
 static volatile bool         s_clk_counted;
 #endif
 
@@ -533,12 +538,6 @@ void ssi_slave_poll(void)
      * for every later cycle -- so drop it and re-arm. */
     uint16_t ndtr = (uint16_t)SSI_RX_STREAM->NDTR;
 
-#if defined(SIMENC_CLOCK_COUNTER)
-    if (CLK_TIM->CNT != 0u) {
-        s_clk_counted = true;
-    }
-#endif
-
     if (ndtr != s_nbytes && ndtr == s_last_ndtr) {
         s_resyncs++;
         data_drive(true);
@@ -658,6 +657,7 @@ void TIM3_IRQHandler(void)
     if (CLK_TIM->SR & TIM_SR_UIF) {
         CLK_TIM->SR   = 0;
         CLK_TIM->CR1 &= ~TIM_CR1_CEN;
+        s_clk_counted = true;
         end_of_message();
     }
 }
