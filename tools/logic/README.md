@@ -36,7 +36,16 @@ python3 analyse.py out_pv0/digital.csv "PV=0" 370085 0
   ./cap2.sh cap_ssi1 "burst 100 50" 0.025 125000000
   python3 variants.py cap_ssi1/digital.csv ssi1 24 74565
   ```
-- `svg2.py` — renders the two-panel figure used in the top-level README.
+- `svg2.py` — renders the two-panel 2 MHz figure used in the top-level README.
+  Takes the PV=1 capture, the `err on` capture, and the output path.
+- `svg500.py` — renders the single-panel 500 kHz figure, with the SSI4 fields
+  banded over the bit cells. Takes one capture and the output path, and decodes
+  the frame itself, so the caption's numbers come from the capture rather than
+  being copied in by hand.
+
+Both draw a faint rule at every clock rising edge. That is deliberate: the
+specification puts each data bit on the rising edge, so the grid is what makes
+the known half-period deviation visible instead of merely asserted.
 
 `cap2.sh` does not set the position: send `fixed <value>` yourself before
 calling it, and pass the same value to the analysis. It used to force

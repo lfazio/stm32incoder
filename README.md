@@ -496,13 +496,34 @@ was silently stale for exactly that reason. (This used to cite a commit hash;
 history has since been rewritten twice, which made the hash dangle. The build
 configuration is the durable reference.)
 
-![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
+### The ordinary case, at 500 kHz
+
+Start here rather than at the 2 MHz corner. At 500 kHz one bit is 2 µs, so a
+whole Read Cycle fits on the page at a scale where the frame layout is legible
+— which the 2 MHz figure below cannot do, because there the parts worth seeing
+are a few hundred nanoseconds wide and need their own zoom.
+
+![One SSI4 Read Cycle captured at 500 kHz](docs/img/ssi4-500khz-capture.svg)
+
+One cycle, all 32 clocks, with the SSI4 fields banded over the bit cells: PV,
+ZPD, PD[18:0], TS[10:0]. The payload decoded straight off the capture is
+`PD=370085` — the 0x5A5A5 that was set — with PV=1 and ZPD=1, and the whole run
+is **200/200 correct**, 32 clocks on every cycle, `Tmu = 20.16 µs` mean
+(20.10–20.21), gap LOW throughout. The Error Flag follows the last rising edge
+by 0.83 µs.
 
 The faint vertical rules mark every **clock rising edge** — the edges the
 specification says each data bit should be set on. DATA transitions land
 between them, on the falling edges, which is the KNOWN DEVIATION above shown
-directly. The green rule is the first falling edge, which starts the Read Cycle
-and triggers the EXTI3 handover.
+directly rather than asserted. The green rule is the first falling edge, which
+starts the Read Cycle and triggers the EXTI3 handover.
+
+### The 2 MHz corner
+
+![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
+
+Same conventions: rising-edge rules, green first falling edge. The second panel
+zooms on the handover, which at this rate is the tightest thing in the design.
 
 | Property | Specified | Measured (200 Read Cycles) |
 |---|---|---|
