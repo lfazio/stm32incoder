@@ -57,12 +57,9 @@ option(SIMENC_RISING_EDGE "DATA changes on the rising clock edge" OFF)
 # writes the next bit, which is what 5.4.1 note 2 describes. Removes the SPI,
 # the EXTI3 pin handover and its 250 ns deadline, and the multiple-of-8 frame
 # limit. Requires SIMENC_CLOCK_COUNTER for the ETR edge source.
+# Needs the SSI clock on PC6 (TIM3_CH1, morpho CN10-4). End of message comes
+# from the data DMA finishing, so this does not need the ETR clock counter.
 option(SIMENC_TIMER_DATA "Shift DATA with TIM3+DMA instead of SPI1" OFF)
-if(SIMENC_TIMER_DATA AND NOT SIMENC_CLOCK_COUNTER)
-  message(FATAL_ERROR
-    "SIMENC_TIMER_DATA requires SIMENC_CLOCK_COUNTER: the bits are clocked by "
-    "TIM3 counting the SSI clock on ETR (PD2 / CN7-4).")
-endif()
 if(SIMENC_RISING_EDGE AND NOT SIMENC_CLOCK_COUNTER)
   message(FATAL_ERROR
     "SIMENC_RISING_EDGE requires SIMENC_CLOCK_COUNTER: deferring SPE to the "

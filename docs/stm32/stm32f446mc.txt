@@ -1,0 +1,101 @@
+                                                                                 Table 11. Alternate function (continued)
+
+
+
+
+                                                                                                                                                                                                  STM32F446xC/E
+                             AF0       AF1         AF2         AF3        AF4      AF5         AF6         AF7        AF8       AF9         AF10      AF11      AF12      AF13     AF14   AF15
+
+
+                     Port                                                                                SPI2/3/    SAI/   CAN1/2           SAI2/
+                                                                                                                                                                FMC/
+                                                            TIM8/9/10/11 I2C1/2/3            SPI2/3/4/ USART1/2/3 USART6/ TIM12/13/       QUADSPI/
+                             SYS      TIM1/2     TIM3/4/5
+                                                               CEC        /4/CEC
+                                                                                  SPI1/2/3/4
+                                                                                              SAI1      /UART5/   UART4/5/   14/          OTG2_HS/
+                                                                                                                                                     OTG1_FS    SDIO/     DCMI      -     SYS
+                                                                                                                                                               OTG2_FS
+                                                                                                        SPDIFRX   SPDIFRX QUADSPI         OTG1_FS
+
+                                                               TIM8_                                    SPI3_MOSI/   UART4_               OTG_HS_                                         EVENT
+                       PB0     -     TIM1_CH2N   TIM3_CH3                  -         -          -                                 -                     -      SDIO_D1      -       -
+                                                               CH2N                                      I2S3_SD      CTS                 ULPI_D1                                          OUT
+
+                                                               TIM8_                                                                      OTG_HS_                                         EVENT
+                       PB1     -     TIM1_CH3N   TIM3_CH4                  -         -          -           -          -          -                     -      SDIO_D2      -       -
+                                                               CH3N                                                                       ULPI_D2                                          OUT
+
+                                                                                              SAI1_     SPI3_MOSI/            QUADSPI_    OTG_HS_                                         EVENT
+                       PB2     -     TIM2_CH4       -            -         -         -                                 -                                -      SDIO_CK      -       -
+                                                                                              SD_A       I2S3_SD                CLK       ULPI_D4                                          OUT
+
+                             JTDO/                                                           SPI3_SCK
+                                                                         I2C2_   SPI1_SCK                                                                                                 EVENT
+                       PB3   TRACE   TIM2_CH2       -            -                                /         -          -          -          -          -         -         -       -
+                                                                          SDA    /I2S1_CK                                                                                                  OUT
+                              SWO                                                             I2S3_CK
+
+                             NJTRS                                       I2C3_                SPI3_     SPI2_NSS/                                                                         EVENT
+                       PB4               -       TIM3_CH1        -               SPI1_MISO                             -          -          -          -         -         -       -
+                               T                                          SDA                 MISO       I2S2_WS                                                                           OUT
+
+                                                                                               SPI3_
+                                                                         I2C1_   SPI1_MOSI                                                OTG_HS_               FMC_      DCMI_           EVENT
+                       PB5     -         -       TIM3_CH2        -                             MOSI/        -          -      CAN2_RX                   -                           -
+
+
+
+
+DS10693 Rev 11
+                                                                         SMBA     /I2S1_SD                                                ULPI_D7              SDCKE1      D10             OUT
+                                                                                             I2S3_SD
+
+                                                              HDMI_      I2C1_                          USART1_                           QUADSPI_              FMC_                      EVENT
+                       PB6     -         -       TIM4_CH1                            -          -                      -      CAN2_TX                   -                DCMI_D5    -
+                                                               CEC        SCL                             TX                              BK1_NCS               SDNE1                      OUT
+
+                                                                         I2C1_                          USART1_      SPDIF_                                              DCMI_            EVENT
+                       PB7     -         -       TIM4_CH2        -                   -          -                                 -          -          -      FMC_NL               -
+                                                                          SDA                             RX          RX0                                                VSYNC             OUT
+                 B
+                                     TIM2_CH1/                TIM10_     I2C1_                                                                                                            EVENT
+                       PB8     -                 TIM4_CH3                            -          -           -          -      CAN1_RX        -          -      SDIO_D4   DCMI_D6    -
+                                     TIM2_ETR                  CH1        SCL                                                                                                              OUT
+
+                                                              TIM11_     I2C1_   SPI2_NSS/    SAI1_                                                                                       EVENT
+                       PB9     -     TIM2_CH2    TIM4_CH4                                                   -          -      CAN1_TX        -          -      SDIO_D5   DCMI_D7    -
+                                                               CH1        SDA     I2S2_WS     FS_B                                                                                         OUT
+
+                                                                         I2C2_   SPI2_SCK/    SAI1_     USART3_                           OTG_HS_                                         EVENT
+                      PB10     -     TIM2_CH3       -            -                                                     -          -                     -         -         -       -
+                                                                          SCL     I2S2_CK     SCK_A       TX                              ULPI_D3                                          OUT
+
+                                                                         I2C2_                          USART3_      SAI2_                                                                EVENT
+                      PB11     -     TIM2_CH4       -            -                   -          -                                 -          -          -         -         -       -
+                                                                          SDA                             RX         SD_A                                                                  OUT
+
+
+
+
+                                                                                                                                                                                                  Pinout and pin description
+                                                                         I2C2_   SPI2_NSS/    SAI1_     USART3_                           OTG_HS_               OTG_                      EVENT
+                      PB12     -     TIM1_BKIN      -            -                                                     -      CAN2_RX                   -                   -       -
+                                                                         SMBA     I2S2_WS     SCK_B       CK                              ULPI_D5               HS_ID                      OUT
+
+                                                                                 SPI2_SCK/              USART3_                           OTG_HS_                                         EVENT
+                      PB13     -     TIM1_CH1N      -            -         -                    -                      -      CAN2_TX                   -         -         -       -
+                                                                                  I2S2_CK                 CTS                             ULPI_D6                                          OUT
+
+                                                               TIM8_                                    USART3_                                                  OTG_                     EVENT
+                      PB14     -     TIM1_CH2N      -                      -     SPI2_MISO      -                      -      TIM12_CH1      -          -                   -       -
+                                                               CH2N                                       RTS                                                   HS_DM                      OUT
+
+                             RTC_                              TIM8_             SPI2_MOSI                                                                      OTG_                      EVENT
+                      PB15           TIM1_CH3N      -                      -                    -           -          -      TIM12_CH2      -          -                   -       -
+                             REFIN                             CH3N               /I2S2_SD                                                                      HS_DP                      OUT
+
+
+
+59/197
+

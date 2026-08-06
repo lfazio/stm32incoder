@@ -73,9 +73,9 @@
 #if defined(SIMENC_TIMER_DATA)
 /* The DATA stream is 4, whose flags live in the HIGH interrupt registers --
  * unlike the SPI streams above, which are 2 and 3 and use the LOW ones. */
-#define SSI_DATA_CLEAR_FLAGS (DMA_HIFCR_CTCIF4 | DMA_HIFCR_CHTIF4 | \
-                              DMA_HIFCR_CTEIF4 | DMA_HIFCR_CDMEIF4 | \
-                              DMA_HIFCR_CFEIF4)
+#define SSI_DATA_CLEAR_FLAGS (DMA_LIFCR_CTCIF2 | DMA_LIFCR_CHTIF2 | \
+                              DMA_LIFCR_CTEIF2 | DMA_LIFCR_CDMEIF2 | \
+                              DMA_LIFCR_CFEIF2)
 #endif
 
 #if defined(SIMENC_CLOCK_COUNTER)
@@ -246,12 +246,12 @@ static void ssi_arm(void)
      * watchdog seeing an idle count and nothing to resync. Mask UDE first, and
      * unmask only once the stream is loaded and enabled. */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-    CLK_TIM->DIER &= ~TIM_DIER_TDE;
+    CLK_TIM->DIER &= ~TIM_DIER_UDE;
     CLK_TIM->SR    = 0;
 
     SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
     while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
-    DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
+    DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
 
     SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
     SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
@@ -261,7 +261,7 @@ static void ssi_arm(void)
      * rising edge overwrites it with D(n-1). */
     CLK_TIM->CNT   = 0;
     CLK_TIM->SR    = 0;
-    CLK_TIM->DIER |= TIM_DIER_TDE;
+    CLK_TIM->DIER |= TIM_DIER_UDE;
     CLK_TIM->CR1  |= TIM_CR1_CEN;
     s_armed = true;
 }
@@ -475,39 +475,52 @@ static void clock_counter_init(void)
 {
     GPIO_InitTypeDef io = {0};
 
+#if defined(SIMENC_TIMER_DATA)
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    io.Pin       = SSI_CLKIN_PIN;
+    io.Alternate = SSI_CLKIN_AF;
+#else
     __HAL_RCC_GPIOD_CLK_ENABLE();
-
-    /* Pull up to match the SSI idle level, so a missing wire idles high rather
-     * than floating and counting noise. It still will not count -- that is the
-     * point of the check in ssi_slave_clock_counter_ok(). */
     io.Pin       = SSI_ETR_PIN;
+    io.Alternate = SSI_ETR_AF;
+#endif
+    /* Pull up to match the SSI idle level, so a missing wire idles high rather
+     * than floating and counting noise. It still will not count to n -- that is
+     * the point of the check in ssi_slave_clock_counter_ok(). */
     io.Mode      = GPIO_MODE_AF_PP;
     io.Pull      = GPIO_PULLUP;
     io.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-    io.Alternate = SSI_ETR_AF;
+#if defined(SIMENC_TIMER_DATA)
+    HAL_GPIO_Init(SSI_CLKIN_GPIO, &io);
+#else
     HAL_GPIO_Init(SSI_ETR_GPIO, &io);
+#endif
 
     __HAL_RCC_TIM3_CLK_ENABLE();
 
     CLK_TIM->CR1 = 0;
     CLK_TIM->PSC = 0;                      /* count every edge, not every Nth */
-    /* Never 0. RM0390: "The counter is blocked while the auto-reload value is
+#if defined(SIMENC_TIMER_DATA)
+    /* Two edges per bit, so an update every second edge is one per bit -- and
+     * because the clock idles HIGH the edges pair up (F1,R1), (F2,R2)..., which
+     * puts every update on a rising edge.
+     *
+     * Never 0. RM0390: "The counter is blocked while the auto-reload value is
      * null" -- with ARR=0 the timer does not count at all, raises no events and
-     * requests no DMA. It looks perfectly configured while doing nothing, which
-     * cost a debugging session: every register read back correct and NDTR sat
-     * at n through a 5000-cycle burst. */
+     * requests no DMA, while every register still reads back correct. */
+    CLK_TIM->ARR = 1u;
+#else
     CLK_TIM->ARR = (uint32_t)s_cfg.n_bits - 1u;
+#endif
 
 #if defined(SIMENC_TIMER_DATA)
-    /* External clock mode 1: SMS=111 with TS=111 (ETRF) clocks the counter from
-     * ETR *and* makes every edge a trigger event. That matters because the DMA
-     * request has to come per edge, and the update event cannot supply it --
-     * update fires once per n counts, and forcing it per edge would need ARR=0,
-     * which blocks the counter outright. TDE turns each trigger event into one
-     * DMA request, so one rising edge writes one bit, whatever ARR is.
-     * ETP=0 selects rising edges: the edge the encoder shifts on. */
-    CLK_TIM->SMCR = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
-                  | TIM_SMCR_TS_0  | TIM_SMCR_TS_1  | TIM_SMCR_TS_2;
+    /* External clock mode 1 (SMS=111) with TS=100 = TI1F_ED, the channel-1
+     * edge detector: it pulses on *both* edges of TI1, so the counter advances
+     * at twice the bit rate. CC1S=01 maps the pin to IC1 so the detector sees
+     * it; the capture value itself is never read, only the edges matter. */
+    CLK_TIM->CCMR1 = TIM_CCMR1_CC1S_0;
+    CLK_TIM->SMCR  = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
+                   | TIM_SMCR_TS_2;
 #else
     /* External clock mode 2 (RM0390 17.3.12): ECE=1 clocks the counter from
      * ETRF. ETP=0 counts rising edges, which is where the receive DMA completes
@@ -520,7 +533,7 @@ static void clock_counter_init(void)
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
 #if defined(SIMENC_TIMER_DATA)
-    CLK_TIM->DIER = TIM_DIER_TDE;          /* one DMA request per clock edge */
+    CLK_TIM->DIER = TIM_DIER_UDE;          /* one DMA request per rising edge */
 #else
     CLK_TIM->DIER = TIM_DIER_UIE;
 #endif
@@ -574,24 +587,24 @@ static void data_dma_init(void)
 
 /* End of message: the DMA has written all n bits, so the last rising edge has
  * just happened. 5.4.1 note 3 puts the Error Flag here. */
-void DMA1_Stream4_IRQHandler(void)
+void DMA1_Stream2_IRQHandler(void)
 {
-    if (DMA1->HISR & DMA_HISR_TCIF4) {
+    if (DMA1->LISR & DMA_LISR_TCIF2) {
         /* Stop the request source in the same breath as ending the message, so
          * nothing can be raised during the gap that survives into the re-arm. */
         CLK_TIM->CR1  &= ~TIM_CR1_CEN;
-        CLK_TIM->DIER &= ~TIM_DIER_TDE;
+        CLK_TIM->DIER &= ~TIM_DIER_UDE;
 
         data_drive(s_gap_level);
 
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-        DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
+        DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
         s_armed = false;
         s_frames++;
         s_clk_counted = true;
         gap_timer_start();
     } else {
-        DMA1->HIFCR = SSI_DATA_CLEAR_FLAGS;
+        DMA1->LIFCR = SSI_DATA_CLEAR_FLAGS;
     }
 }
 #endif /* SIMENC_TIMER_DATA */

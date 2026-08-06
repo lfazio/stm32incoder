@@ -78,21 +78,37 @@
  * is what 5.4.1 note 2 describes, and the bit is then valid across the falling
  * edge where the controller samples it.
  *
- * The request is TIM3_TRIG, not TIM3_UP: the update event fires once per n
- * counts, and forcing one per edge would need ARR=0, which RM0390 says blocks
- * the counter outright. The trigger event fires on every ETR edge.
+ * Getting one DMA request per rising edge takes counting at twice the bit
+ * rate. TIM3 is clocked by TI1F_ED, the channel-1 edge detector, which counts
+ * *both* clock edges; with ARR=1 the update event then falls on every second
+ * edge. The clock idles HIGH, so the edges pair up as (F1,R1), (F2,R2)... and
+ * every update lands exactly on a rising edge -- one bit shifted out per rising
+ * edge, which is what 5.4.1 note 2 requires.
  *
- * TIM3_TRIG -> DMA1 **Stream 4**, Channel 5 [RM0390 Rev 9 Table 28], sharing
- * that cell with TIM3_CH1. Note Stream 2 on the same channel carries TIM3_UP
- * and TIM3_CH4 -- a different request. Picking the stream to match the event
- * is not optional: with the stream on 2 and the source set to trigger, the
- * timer counts and sets TIF while the DMA never moves at all.
+ * Nothing writes DATA between F1 and R1, so the first half period stays
+ * untouched, which the SPI handover could never manage.
  *
- * USART2_TX for the trace is Stream 6 Channel 4, so there is no conflict.
+ * Two other routes were tried on hardware and do not work: ARR=0 for an update
+ * per edge blocks the counter outright (RM0390: "The counter is blocked while
+ * the auto-reload value is null"), and the trigger event with TDE fires exactly
+ * once because nothing clears TIF. The update event is the one pattern that
+ * repeats -- the same one the test master's clock generator uses.
+ *
+ * TIM3_UP -> DMA1 Stream 2, Channel 5 [RM0390 Rev 9 Table 28], sharing that
+ * cell with TIM3_CH4. USART2_TX for the trace is Stream 6 Channel 4, so there
+ * is no conflict.
+ *
+ * TI1F_ED is a channel-1 input, not ETR, so the clock has to reach TIM3_CH1:
+ * PC6 on AF2 [DS Table 11], morpho CN10 pin 4 -- the same connector the clock
+ * already comes out on at CN10-31.
  */
-#define SSI_DATA_DMA_STREAM      DMA1_Stream4
+#define SSI_CLKIN_GPIO           GPIOC
+#define SSI_CLKIN_PIN            GPIO_PIN_6
+#define SSI_CLKIN_AF             GPIO_AF2_TIM3
+
+#define SSI_DATA_DMA_STREAM      DMA1_Stream2
 #define SSI_DATA_DMA_CHANNEL     5u
-#define SSI_DATA_DMA_IRQn        DMA1_Stream4_IRQn
+#define SSI_DATA_DMA_IRQn        DMA1_Stream2_IRQn
 #define SSI_DATA_BSRR            (&GPIOB->BSRR)
 
 #define SSI_MASTER_SPI           SPI2
