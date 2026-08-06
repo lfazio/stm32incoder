@@ -213,11 +213,23 @@ latch is 10 kHz** (4.12 says "< 0.1 ms", and 5.5.1 pins it by calling ASI2's
 Stamp counter ticks at 100 kHz**, 10 us resolution (5.4.2). 100 kHz is the
 counter, not the latch -- do not "fix" the update rate to 100 kHz.
 
-DATA changes on the **falling** edge; measured, bits 1..31 transition 10 ns
-after it and none after a rising edge. Only bit 0 is late, ~209 ns, because
-EXTI3 hands the pin over on the first falling edge -- at 2 MHz that is 41% of a
-period and on a scope looks like it toggles at the clock edge. That is expected,
-not a defect.
+**Known deviation, unfixed: DATA changes on the falling edge and it should
+change on the rising edge.** POSITAL, RLS and IncOder 5.4.1 note 2 all say the
+encoder sets each bit on the rising edge, with the controller reading it in the
+low phase that follows. We are half a clock period early, so a controller
+sampling on the falling edge reads the stream shifted by one bit.
+
+It is not a one-line change: SSI's data phase is not an SPI slave mode. With an
+idle-high clock, CPOL=1/CPHA=1 changes on the falling edge (ours), CPOL=1/CPHA=0
+changes on the rising edge but presents the MSB a full bit early, and
+CPOL=0/CPHA=1 has the right phase but will not synchronise with the clock idling
+high -- tried, broke the link, ok=40 bad=158. The route that should work is
+CPOL=0/CPHA=1 with SPE enabled only after the first falling edge, which moves
+the SPE write into EXTI3_IRQHandler and its ~26 ns of margin. Measure it, do not
+reason about it.
+
+Note the loopback proves nothing about this: the on-board test master samples on
+the rising edge, matching our own bug.
 
 The Tmu correction is dynamic. Do not replace it with a constant: the
 half-clock-period term ranges from 0.25 us at 2 MHz to 5 us at 100 kHz, and a

@@ -277,30 +277,48 @@ went from `ok=198 bad=0` to `ok=7 bad=191` if `wire` had run first. With the
 reset it is `ok=198 bad=0` either way, and the first Read Cycle after `wire` —
 which used to be reliably wrong — now decodes correctly too.
 
-### DATA changes on the falling edge — but the first bit looks different
+### KNOWN DEVIATION — DATA changes on the falling edge, and it should not
 
-Scoping the link can suggest DATA toggles on the *rising* edge. Measured over a
-2 MHz capture, it does not:
+**The emulator drives each data bit half a clock period earlier than SSI
+specifies.** This is unfixed. If your controller samples on the falling edge —
+which is what the protocol expects — it will read the bit stream shifted by one
+bit position.
 
-| | delay after the falling edge | as a fraction of T |
-|---|---|---|
-| bits 1…31 | **10 ns** | 2 % |
-| bit 0 (D31) | **209 ns** | 41 % |
+What the sources say, consistently:
 
-Zero of 6157 later-bit transitions occurred after a rising edge. The steady-state
-behaviour is the standard SSI relationship — DATA changes on the falling edge,
-the controller samples on the rising edge — which is also what makes §5.4.1
-note 3 coherent: the line can only be "set by the Error Flag after the last
-rising edge" if the data bits were already changing on the falling edges.
+- POSITAL: "With the following rising edge transition of the clock signal the
+  transmission begins with the most significant bit (MSB). With each following
+  rising edge transition of the clock signal, the next bit is set on the output
+  of the data line."
+- RLS: "The MSB then appears on the DATA output at the next rising edge… At each
+  subsequent rising edge of the CLOCK the next bit is transmitted."
+- IncOder §5.4.1 note 2, read literally: "Each rising edge of the CLOCK
+  transmits the next data bit of the message, starting with Dn-1."
 
-The **first** bit is the exception, and it is the EXTI3 handover: DATA is held
-HIGH by GPIO until the master's first falling edge, so D31 appears ~209 ns late.
-At 2 MHz that is 41 % of the way to the rising edge, which on a scope reads as
-"toggling at the clock edge". It still meets setup time, with the ~26 ns margin
-measured in "Critical path in SRAM", and the fraction shrinks at lower clock
-rates — at 500 kHz the same 209 ns is 10 % of a period.
+So the encoder must **set** each bit on the rising edge; the controller reads it
+during the low phase that follows. Measured on our output at 2 MHz, bits 1…31
+change **10 ns after the falling edge** and none after a rising edge — half a
+period early.
 
-### Oversampling and the update rate
+Why it is not a one-line fix: **SSI's data phase is not an SPI slave mode.**
+With the clock idling high, CPOL=1/CPHA=1 changes data on the falling edge (what
+we do, half a period early) and CPOL=1/CPHA=0 changes it on the rising edge but
+presents the MSB a full bit early. CPOL=0/CPHA=1 has the right phase, but the
+slave cannot synchronise when the clock idles high — tried, and it broke the
+link outright (`ok=40 bad=158`, `resyncs=2`).
+
+The workable route, not yet done: with CPOL=0/CPHA=1, enable `SPE` only *after*
+the first falling edge, so the peripheral starts from the idle-low state it
+expects and its first edge is rising #1, which is exactly when the MSB is due.
+That moves the `SPE` write into `EXTI3_IRQHandler`, which has ~26 ns of margin
+today, so it needs measuring on the analyser rather than reasoning.
+
+Until then, the emulator interoperates with a controller that samples on the
+**rising** edge, which is what the on-board test master does — so the loopback
+results elsewhere in this document are self-consistent but do not prove
+conformance on this point.
+
+### Oversampling and the update rate### Oversampling and the update rate
 
 Two rates, easily conflated, and the guide fixes both:
 
