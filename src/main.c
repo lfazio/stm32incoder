@@ -1,7 +1,7 @@
 /* simenc -- Zettlex IncOder emulator (SSI4) on NUCLEO-F446RE.
  *
  * Layering, bottom up:
- *   ssi_slave  generic SSI slave transport (SPI1 + DMA, Tmu gap, idle-high)
+ *   ssi_slave  generic SSI slave transport (TIM8 + DMA, Tmu gap, idle-high)
  *   ssi4       SSI4 payload codec (PV / ZPD / PD[18:0] / TS[10:0])
  *   incoder    sensor behaviour: position, zero point, timestamp, validity
  *

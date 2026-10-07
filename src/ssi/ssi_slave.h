@@ -19,12 +19,13 @@
  * This layer is payload agnostic: it moves n bits and knows nothing about
  * what they mean. SSI4 (and later SSI1/2/6/9) sit on top of it.
  *
- * Implementation: SPI1 in slave mode with CPOL=1/CPHA=1, which makes the
- * hardware change DATA on the falling edge and the master sample it on the
- * rising edge -- exactly the SSI edge relationship. Bits are shifted by the
- * SPI shift register and fed by DMA, so no interrupt runs per bit. The receive
- * DMA is what counts clocks: its transfer-complete event marks the end of the
- * n-bit message.
+ * Implementation: no peripheral shifts the bits. The incoming SSI clock drives
+ * TIM8 through its channel-1 edge detector, counting both edges, and two
+ * compare channels raise DMA requests that write GPIOB->BSRR -- one per rising
+ * edge for the next data bit, one per falling edge for the Error Flag slot.
+ * DATA is therefore set on the rising edge, as 5.4.1 note 2 requires, and the
+ * DMA's transfer-complete marks the end of the n-bit message. No interrupt runs
+ * per bit, and the data pin never changes owner mid-frame.
  */
 #ifndef SIMENC_SSI_SLAVE_H
 #define SIMENC_SSI_SLAVE_H

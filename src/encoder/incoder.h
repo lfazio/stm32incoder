@@ -2,7 +2,7 @@
  *
  * Sits on top of the SSI4 codec and the generic SSI slave transport: this
  * module owns the sensor behaviour (position, zero point, timestamp, validity)
- * and knows nothing about SPI or DMA.
+ * and knows nothing about timers or DMA.
  *
  * Timing behaviour taken from the Product Guide:
  *   - Internal Position Update Period < 0.1 ms (4.12) -- we latch a new

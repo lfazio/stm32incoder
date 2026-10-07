@@ -30,54 +30,11 @@ endif()
 set(SIMENC_CLOCK_SOURCE "AUTO" CACHE STRING "System clock source: AUTO, HSE or HSI")
 set_property(CACHE SIMENC_CLOCK_SOURCE PROPERTY STRINGS AUTO HSE HSI)
 
-# --- Critical path placement --------------------------------------------------
-# ON (default): run the timing-critical SSI handlers from SRAM (.RamFunc) rather
-# than flash. There is no TCM on this Cortex-M4; SRAM execution is the
-# equivalent. Measured effect on the EXTI3 handover at 2 MHz (see README):
-# it halves the jitter, which is what a hard deadline cares about.
-option(SIMENC_RAMFUNC "Run the critical SSI handlers from SRAM" ON)
-
-# End of message from a hardware clock counter (TIM3 external clock on ETR)
-# rather than from the receive DMA's byte count. Removes the byte-alignment
-# constraint that keeps SSI7/SSI8 out, and unblocks the clock-edge fix.
-#
-# OFF by default and NOT hardware-validated: it needs the SSI clock wired to
-# PD2 (TIM3_ETR, morpho CN7-4) as well as PB3, and without that wire the
-# counter never counts and the link goes dead. See the README.
-option(SIMENC_CLOCK_COUNTER "End of message from a TIM3 clock counter" OFF)
-
-# Put DATA on the rising clock edge, which is what the specification requires.
-# Needs SIMENC_CLOCK_COUNTER: it defers SPE to the first falling edge, which
-# costs the receive path one capture edge, and that count is what the default
-# end-of-message detection uses. EXPERIMENTAL -- see the README.
-option(SIMENC_RISING_EDGE "DATA changes on the rising clock edge" OFF)
-
-# Shift DATA out with TIM3 + DMA -> GPIOB->BSRR, clocked by the SSI clock
-# itself, instead of borrowing the SPI1 shift register. Each clock rising edge
-# writes the next bit, which is what 5.4.1 note 2 describes. Removes the SPI,
-# the EXTI3 pin handover and its 250 ns deadline, and the multiple-of-8 frame
-# limit. Requires SIMENC_CLOCK_COUNTER for the ETR edge source.
-# The default data path. TIM8 is clocked by the SSI clock itself and DMA shifts
-# each bit onto GPIOB->BSRR, so DATA changes on the rising edge, nothing touches
-# the line in the first bit period, the Error Flag is placed by hardware at the
-# last falling edge, and there is no per-frame pin handover and no 250 ns
-# deadline. Turn it OFF to fall back to the SPI1 shift register.
-#
-# REQUIRES the SSI clock wired to PC6 (TIM8_CH1, morpho CN10-4) as well as PB3.
-# Without that wire the counter never counts and the link is dead; `stat` says
-# so rather than leaving it a puzzle.
-option(SIMENC_TIMER_DATA "Shift DATA with TIM8+DMA instead of SPI1" ON)
-if(SIMENC_RISING_EDGE AND NOT SIMENC_CLOCK_COUNTER)
-  message(FATAL_ERROR
-    "SIMENC_RISING_EDGE requires SIMENC_CLOCK_COUNTER: deferring SPE to the "
-    "first falling edge costs the receive path one capture edge, so end of "
-    "message can no longer come from the receive byte count.")
-endif()
 
 set(HAL_MODULES
     hal hal_cortex hal_rcc hal_rcc_ex hal_gpio hal_dma hal_dma_ex hal_pwr
     hal_pwr_ex hal_flash hal_flash_ex hal_flash_ramfunc hal_adc hal_adc_ex
-    hal_tim hal_tim_ex hal_uart hal_spi hal_exti)
+    hal_tim hal_tim_ex hal_uart)
 
 set(HAL_SOURCES "")
 foreach(m ${HAL_MODULES})
@@ -111,10 +68,6 @@ target_compile_definitions(simenc.elf PRIVATE
     STM32F446xx
     USE_HAL_DRIVER
     SIMENC_CLOCK_SOURCE_${SIMENC_CLOCK_SOURCE}=1
-    $<$<BOOL:${SIMENC_RAMFUNC}>:SIMENC_RAMFUNC=1>
-    $<$<BOOL:${SIMENC_CLOCK_COUNTER}>:SIMENC_CLOCK_COUNTER=1>
-    $<$<BOOL:${SIMENC_RISING_EDGE}>:SIMENC_RISING_EDGE=1>
-    $<$<BOOL:${SIMENC_TIMER_DATA}>:SIMENC_TIMER_DATA=1>
 )
 
 target_compile_options(simenc.elf PRIVATE

@@ -21,39 +21,22 @@ void ssi_master_init(void);
  * may be started (section 5.4.1). */
 bool ssi_master_data_idle_high(void);
 
-/* Runs one Read Cycle of n_bits and returns the raw message, MSB first.
- * Returns false if the line was not idle beforehand. */
-bool ssi_master_read(uint8_t n_bits, uint32_t *raw);
-
-/* Selects the clock rate. Only the prescaler values that land inside the
- * SSI window are accepted; returns the rate actually programmed, in Hz. */
-uint32_t ssi_master_set_clock(uint32_t requested_hz);
-uint32_t ssi_master_get_clock(void);
-
 void ssi_master_delay_us(uint32_t us);
 
-/* Runs one Read Cycle at the timer-generated clock rate (see
- * ssi_master_set_exact_clock; 2.000 MHz by default, the SSI maximum).
+/* Runs one Read Cycle at the clock rate set by ssi_master_set_exact_clock
+ * (500 kHz at power-on).
  *
- * The SPI baud generator cannot produce it: SPI2 is clocked from PCLK1 =
- * 45 MHz and divides by powers of two, so the closest legal rates are
- * 1.40625 MHz and 2.8125 MHz (the latter 40 % over the limit). This engine
- * instead drives the clock pin as a plain GPIO, writing GPIOB->BSRR from DMA
- * on TIM1 compare events -- TIM1 runs at 180 MHz, and 180/90 = 2.000 MHz
- * exactly. DATA is captured by a third DMA reading GPIOB->IDR.
- *
- * The pin assignment and wiring are unchanged; only the pin's mode differs
- * while this engine runs.
- *
- * At the 2 MHz top of the range this is the worst case for the slave: its EXTI3
- * handover then has just half a clock period, 250 ns, to put DATA on the line
- * before the master samples. */
+ * The clock pin is a plain GPIO driven by DMA writes to GPIOB->BSRR on TIM1
+ * compare events; TIM1 runs at 180 MHz, so any rate of the form 180 MHz / N is
+ * exact, including 2.000 MHz at the top of the SSI window. DATA is captured by
+ * a third DMA reading GPIOB->IDR, late in the high phase -- where an SSI
+ * controller samples, since the encoder sets each bit on the rising edge and it
+ * stays valid across the fall. */
 bool     ssi_master_read_timer(uint8_t n_bits, uint32_t *raw);
 uint32_t ssi_master_exact_hz(void);
 
-/* Sets the timer-generated rate. Unlike the SPI baud generator, which only
- * reaches four rates inside the SSI window, this covers the whole 100 kHz ..
- * 2 MHz range in steps of 180 MHz / N. Returns the rate actually programmed. */
+/* Sets the clock rate, anywhere in 100 kHz .. 2 MHz in steps of 180 MHz / N.
+ * Returns the rate actually programmed. */
 uint32_t ssi_master_set_exact_clock(uint32_t requested_hz);
 
 /* Post-mortem of the last timer-engine burst: NDTR of the low/high/sample streams,
@@ -62,19 +45,13 @@ void ssi_master_timer_debug(uint32_t *out7);
 
 /* Continuity self-test for the loopback jumpers.
  *
- * Drives the two source pins (PB10 clock out, PB4 data out) as plain GPIO and
- * checks that the destination pins (PB3, PB14) follow both levels. Answers
- * "is the wire actually there" without a meter. The SSI slave must be
- * re-armed with ssi_slave_start() afterwards. */
+ * Drives the two source pins (PB10 clock out, PB4 data out) and checks that
+ * the destinations follow both levels: PC6 for the clock -- the pin that
+ * clocks TIM8, and so the one that matters -- and PB14 for DATA. Answers "is
+ * the wire actually there" without a meter. The SSI slave must be re-armed
+ * with ssi_slave_start() afterwards. */
 bool ssi_loopback_check(bool *clock_ok, bool *data_ok);
 
-/* Propagation delay from the master's clock output to each of the two places
- * the clock is consumed: PB3 (the SPI/EXTI input) and PC6 (TIM8's input, which
- * shifts DATA in the default build). Both are timed the same way with the DWT
- * cycle counter, so the polling overhead is common-mode and the *difference*
- * between them is the meaningful number -- it is the skew between the two taps,
- * which shows up directly as DATA landing early or late against the clock a
- * logic analyser sees. Returns nanoseconds. */
-void ssi_clock_skew(uint32_t *pb3_ns, uint32_t *pc6_ns);
+
 
 #endif /* SIMENC_SSI_MASTER_H */

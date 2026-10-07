@@ -24,13 +24,12 @@
  * averaging (sqrt 12).
  *
  * Pushing this further means a faster ADC clock and shorter sampling, which
- * costs bus bandwidth -- and the EXTI3 handover has only 26 ns of margin and
- * was measured to be bus-contention sensitive, not flash-fetch sensitive. Do
- * not raise it without re-measuring the handover on the analyser. */
+ * costs bus bandwidth, which the SSI data path shares. Do not raise it without
+ * re-checking the bit timing on an analyser. */
 #define ADC_AVG_SAMPLES  12u
 
 /* ADC1 -> DMA2 Stream 0, channel 0 (RM0390 Rev 9 Table 29). Stream 4 carries
- * the same request; streams 2/3 are taken by SPI1. */
+ * the same request; streams 3/7 are taken by the slave's DATA path. */
 #define ADC_DMA_STREAM   DMA2_Stream0
 #define ADC_DMA_CHANNEL  0u
 

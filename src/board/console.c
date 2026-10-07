@@ -115,7 +115,7 @@ void console_banner(void)
                  (unsigned long)(SYSCLK_HZ / 1000000u),
                  board_clock_source_name(),
                  board_timestamp_in_spec() ? "" : "  [timestamp OUT OF SPEC]");
-    trace_printf("SSI slave: CLK=PB3(D3) DATA=PB4(D5)   %s, n=%u bits, Tmu=20us\r\n",
+    trace_printf("SSI slave: CLK=PC6(CN10-4) DATA=PB4(D5)  %s, n=%u bits, Tmu=20us\r\n",
                  ssi_variant_name(incoder_variant()),
                  (unsigned)ssi_variant_frame_bits(incoder_variant()));
     trace_printf("SSI master(test): CLK=PB10(D6) DATA=PB14(CN10-28) @ %lu Hz\r\n",
@@ -140,12 +140,9 @@ static void cmd_help(void)
     trace_printf("  ssi 1|2|4|6|9        payload variant; 4 is the default\r\n");
     trace_printf("test master (loopback only):\r\n");
     trace_printf("  wire                 check the loopback jumpers for continuity\r\n");
-    trace_printf("  skew                 clock propagation delay to PB3 vs PC6\r\n");
     trace_printf("  clk <hz>             clock rate, any value 100k..2M (timer)\r\n");
     trace_printf("  read [n]             n Read Cycles, decode each\r\n");
     trace_printf("  burst [n] [gapus]    n cycles, no tracing between; for capture\r\n");
-    trace_printf("  readspi [n]          read via the SPI baud generator\r\n");
-    trace_printf("  burstspi [n] [gapus] burst via the SPI baud generator\r\n");
 }
 
 static void cmd_stat(void)
@@ -181,7 +178,7 @@ static void cmd_stat(void)
 #endif
 }
 
-static void cmd_read(uint32_t count, bool fast)
+static void cmd_read(uint32_t count)
 {
     if (count == 0u) {
         count = 1u;
@@ -191,8 +188,7 @@ static void cmd_read(uint32_t count, bool fast)
         ssi_variant_t v = incoder_variant();
         uint8_t  n   = ssi_variant_frame_bits(v);
         uint32_t raw = 0;
-        bool ok = fast ? ssi_master_read_timer(n, &raw)
-                       : ssi_master_read(n, &raw);
+        bool ok = ssi_master_read_timer(n, &raw);
 
         if (!ok) {
             trace_printf("read %lu: DATA not idle high, aborted\r\n", (unsigned long)i);
@@ -213,7 +209,7 @@ static void cmd_read(uint32_t count, bool fast)
 /* Back-to-back Read Cycles with a fixed gap and no tracing in between, so a
  * logic analyser sees a clean regular pattern to trigger on. Tracing only
  * happens after the burst. The gap is well above Tmu (20 us) as Timg requires. */
-static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
+static void cmd_burst(uint32_t count, uint32_t gap_us)
 {
     uint32_t ok = 0;
     uint32_t bad = 0;
@@ -238,8 +234,7 @@ static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
     for (uint32_t i = 0; i < count; i++) {
         ssi_variant_t v = incoder_variant();
         uint32_t raw = 0;
-        bool got = fast ? ssi_master_read_timer(ssi_variant_frame_bits(v), &raw)
-                        : ssi_master_read(ssi_variant_frame_bits(v), &raw);
+        bool got = ssi_master_read_timer(ssi_variant_frame_bits(v), &raw);
         if (i < warmup) {
             ssi_master_delay_us(gap_us);
             continue;
@@ -269,7 +264,7 @@ static void cmd_burst(uint32_t count, bool fast, uint32_t gap_us)
 
     trace_printf("burst: %lu cycles @ %lu Hz, gap %luus -> ok=%lu bad=%lu pd=%lu\r\n",
                  (unsigned long)count,
-                 (unsigned long)(fast ? ssi_master_exact_hz() : ssi_master_get_clock()),
+                 (unsigned long)ssi_master_exact_hz(),
                  (unsigned long)gap_us, (unsigned long)ok,
                  (unsigned long)bad, (unsigned long)first);
 }
@@ -333,58 +328,44 @@ static void handle_line(char *line)
             trace_printf("bad number '%s'\r\n", arg);
             return;
         }
-        /* The timer engine reaches 180 MHz / N, so anything in the SSI window
-         * is available -- not just the SPI baud generator's four rates. */
+        /* TIM1 compare events reach 180 MHz / N, so anything in the SSI
+         * window is available. */
         uint32_t got = ssi_master_set_exact_clock(req);
-        uint32_t spi = ssi_master_set_clock(req);
         long err_ppt = (req != 0u)
             ? (long)(((int64_t)got - (int64_t)req) * 1000 / (int64_t)req) : 0;
-        trace_printf("master clock = %lu Hz (timer, %+ld.%ld%%)  spi fallback %lu Hz\r\n",
-                     (unsigned long)got, err_ppt / 10, (err_ppt < 0 ? -err_ppt : err_ppt) % 10,
-                     (unsigned long)spi);
-    } else if (strcmp(cmd, "skew") == 0) {
-        uint32_t pb3 = 0, pc6 = 0;
-        ssi_clock_skew(&pb3, &pc6);
-        trace_printf("clock tap delay: PB3 %luns  PC6 %luns  skew %ld ns\r\n",
-                     (unsigned long)pb3, (unsigned long)pc6,
-                     (long)pc6 - (long)pb3);
-        ssi_slave_start();
+        trace_printf("master clock = %lu Hz (%+ld.%ld%%)\r\n",
+                     (unsigned long)got, err_ppt / 10,
+                     (err_ppt < 0 ? -err_ppt : err_ppt) % 10);
     } else if (strcmp(cmd, "wire") == 0) {
         bool ck = false;
         bool dt = false;
         bool ok = ssi_loopback_check(&ck, &dt);
 
-        trace_printf("CLOCK PB10(CN10-25,D6) -> PB3(CN10-31,D3) : %s\r\n",
+        trace_printf("CLOCK PB10(CN10-25,D6) -> PC6(CN10-4)   : %s\r\n",
                      ck ? "OK" : "OPEN");
         trace_printf("DATA  PB4 (CN10-27,D5) -> PB14(CN10-28)   : %s\r\n",
                      dt ? "OK" : "OPEN");
         trace_printf("loopback %s\r\n", ok ? "ready" : "NOT wired");
         ssi_slave_start();      /* the test borrowed the DATA pin */
-    } else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "readspi") == 0) {
-        uint32_t n    = 1u;
-        bool     fast = (strcmp(cmd, "readspi") != 0);
+    } else if (strcmp(cmd, "read") == 0) {
+        uint32_t n = 1u;
         if (arg != NULL && !parse_u32(arg, &n)) {
             trace_printf("bad number '%s'\r\n", arg);
             return;
         }
-        trace_printf("clocking at %lu Hz (%s)\r\n",
-                     (unsigned long)(fast ? ssi_master_exact_hz()
-                                          : ssi_master_get_clock()),
-                     fast ? "timer" : "spi");
-        cmd_read(n, fast);
-        if (fast) {
-            uint32_t d[7];
-            ssi_master_timer_debug(d);
-            trace_printf("  ndtr lo=%lu hi=%lu smp=%lu  tim cnt=%lu sr=%08lX\r\n",
-                         (unsigned long)d[0], (unsigned long)d[1],
-                         (unsigned long)d[2], (unsigned long)d[3],
-                         (unsigned long)d[4]);
-            trace_printf("  dma2 lisr=%08lX hisr=%08lX\r\n",
-                         (unsigned long)d[5], (unsigned long)d[6]);
-        }
-    } else if (strcmp(cmd, "burst") == 0 || strcmp(cmd, "burstspi") == 0) {
-        uint32_t n    = 50u;
-        bool     fast = (strcmp(cmd, "burstspi") != 0);
+        trace_printf("clocking at %lu Hz\r\n",
+                     (unsigned long)ssi_master_exact_hz());
+        cmd_read(n);
+        uint32_t d[7];
+        ssi_master_timer_debug(d);
+        trace_printf("  ndtr lo=%lu hi=%lu smp=%lu  tim cnt=%lu sr=%08lX\r\n",
+                     (unsigned long)d[0], (unsigned long)d[1],
+                     (unsigned long)d[2], (unsigned long)d[3],
+                     (unsigned long)d[4]);
+        trace_printf("  dma2 lisr=%08lX hisr=%08lX\r\n",
+                     (unsigned long)d[5], (unsigned long)d[6]);
+    } else if (strcmp(cmd, "burst") == 0) {
+        uint32_t n = 50u;
         char    *gap  = next_token(&cursor);
         uint32_t g    = 100u;
 
@@ -396,7 +377,7 @@ static void handle_line(char *line)
             trace_printf("bad number '%s'\r\n", gap);
             return;
         }
-        cmd_burst(n, fast, g);
+        cmd_burst(n, g);
     } else if (strcmp(cmd, "ssi") == 0 && arg != NULL) {
         ssi_variant_t v;
         if (!ssi_variant_from_name(arg, &v)) {

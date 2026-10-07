@@ -17,21 +17,17 @@
 /* ---------------------------------------------------------------------------
  * Pin map
  *
- * SSI slave (the emulated IncOder). SPI1 is remapped onto port B so that the
- * clock input does not land on PA5, which carries the LD2 LED [UM 7.6] and is
- * TTa (3.3 V only) [DS Table 10 p.41] -- unsuitable for a 5 V MAX490 output.
+ * SSI slave (the emulated IncOder). No SPI is involved: the incoming clock
+ * drives a timer, and DMA shifts each bit onto a plain GPIO.
  *
- *   PB3  SPI1_SCK  AF5  [DS Table 11 p.59]  CN9-4  (D3)   FT, 5 V tolerant
+ *   PC6  TIM8_CH1  AF3  [DS Table 11 p.60]  CN10-4   FT, 5 V tolerant
  *        <- SSI CLOCK in   (from MAX490 receiver output RO)
- *   PB4  SPI1_MISO AF5  [DS Table 11 p.59]  CN9-6  (D5)
- *        -> SSI DATA out   (to MAX490 driver input DI)
- *   PB5  SPI1_MOSI AF5  [DS Table 11 p.59]  CN9-5  (D4)
- *        unused; configured with a pull-down purely so the slave receive shift
- *        register clocks deterministically -- that is what counts SSI clocks.
+ *   PB4  GPIO out        [DS Table 11 p.59]  CN9-6 (D5) / CN10-27
+ *        -> SSI DATA out  (to MAX490 driver input DI), written by DMA via BSRR
  *
- * SSI master (loopback test harness only, SPI2):
- *   PB10 SPI2_SCK  AF5  [DS Table 11 p.59]  CN9-7  (D6)  / CN10-25
- *   PB14 SPI2_MISO AF5  [DS Table 11 p.59]  CN10-28
+ * SSI master (loopback test harness only, TIM1 compare events + DMA):
+ *   PB10 GPIO out        CN9-7 (D6) / CN10-25   clock out
+ *   PB14 GPIO in         CN10-28                DATA in, sampled from IDR
  *
  * Analog angle input:
  *   PA0  ADC1_IN0       [DS Table 10 p.47]  CN8-1  (A0)  / CN7-28
@@ -44,75 +40,34 @@
  * Status: LD2 on PA5 [UM 7.6], user button B1 on PC13 [UM 7.7].
  * ------------------------------------------------------------------------- */
 
-#define SSI_SLAVE_SPI            SPI1
 #define SSI_SLAVE_GPIO           GPIOB
-#define SSI_SLAVE_SCK_PIN        GPIO_PIN_3
 #define SSI_SLAVE_DATA_PIN       GPIO_PIN_4
-#define SSI_SLAVE_MOSI_PIN       GPIO_PIN_5
-#define SSI_SLAVE_AF             GPIO_AF5_SPI1
-/* Bit position of PB4 inside GPIOB->MODER (2 bits per pin). */
 #define SSI_SLAVE_DATA_PIN_NUM   4u
 
-/* End-of-message clock counter -- only built when SIMENC_CLOCK_COUNTER is on.
+/* DATA shifted out by the incoming clock itself.
  *
- * TIM3 in external clock mode 2 counts SSI clock edges on its ETR input and
- * raises an update event on the nth, which is end of message for any n,
- * byte aligned or not, and independent of what the SPI is doing with the bits.
+ * TIM8 is clocked by TI1F_ED, the channel-1 edge detector, which counts *both*
+ * clock edges. With ARR=1 the counter therefore wraps on every second edge,
+ * and because the SSI clock idles HIGH the edges pair up as (F1,R1), (F2,R2)...
+ * so the wrap always lands on a rising edge. A frozen channel-2 compare with
+ * CCR2=0 matches at that wrap and raises one DMA request, which writes the next
+ * bit to GPIOB->BSRR -- one bit shifted out per rising edge, which is what
+ * 5.4.1 note 2 requires. Nothing writes DATA between F1 and R1, so the first
+ * bit period stays untouched.
  *
- * ETR has to be a second pad: PB3 already carries SPI1_SCK on AF5, and a pad
- * holds one alternate function at a time (its AF1 is TIM2_CH2, no use here).
- * PD2 is TIM3_ETR on AF2 [DS Table 11] and comes out on morpho CN7 pin 4
- * [UM Table 29], so the clock net needs a second wire to it.
- */
-#define SSI_ETR_TIM              TIM3
-#define SSI_ETR_TIM_IRQn         TIM3_IRQn
-#define SSI_ETR_GPIO             GPIOD
-#define SSI_ETR_PIN              GPIO_PIN_2
-#define SSI_ETR_AF               GPIO_AF2_TIM3
-
-/* DATA shifted out by DMA, clocked by the SSI clock itself.
+ * Three things were measured on hardware and do not work, recorded so they are
+ * not retried:
+ *   - ARR=0 for one update per edge blocks the counter outright. RM0390: "The
+ *     counter is blocked while the auto-reload value is null."
+ *   - The trigger event with TDE fires exactly once; nothing clears TIF.
+ *   - DMA1 cannot reach GPIO. It is on AHB1, and driving GPIOB->BSRR from DMA1
+ *     raises a transfer error on the first word and the hardware disables the
+ *     stream (TEIF set, one transfer, stream off). Only DMA2 can -- which is
+ *     why the TIM1 test master always worked. Hence TIM8, the free APB2 timer.
  *
- * TIM3 counts clock rising edges on ETR with ARR=0, so it raises an update
- * event on every one, and TIM3_UP drives a DMA that writes the next bit to
- * GPIOB->BSRR. Each rising edge therefore shifts one bit onto the bus, which
- * is what 5.4.1 note 2 describes, and the bit is then valid across the falling
- * edge where the controller samples it.
- *
- * Getting one DMA request per rising edge takes counting at twice the bit
- * rate. TIM3 is clocked by TI1F_ED, the channel-1 edge detector, which counts
- * *both* clock edges; with ARR=1 the update event then falls on every second
- * edge. The clock idles HIGH, so the edges pair up as (F1,R1), (F2,R2)... and
- * every update lands exactly on a rising edge -- one bit shifted out per rising
- * edge, which is what 5.4.1 note 2 requires.
- *
- * Nothing writes DATA between F1 and R1, so the first half period stays
- * untouched, which the SPI handover could never manage.
- *
- * Two other routes were tried on hardware and do not work: ARR=0 for an update
- * per edge blocks the counter outright (RM0390: "The counter is blocked while
- * the auto-reload value is null"), and the trigger event with TDE fires exactly
- * once because nothing clears TIF. The update event is the one pattern that
- * repeats -- the same one the test master's clock generator uses.
- *
- * The request comes from a compare event, not the update event: measured on
- * hardware, the update event with UDE moves exactly one word and then stops,
- * while compare events repeat -- which is what the test master's own clock
- * generator has always relied on. Channel 1 is occupied being the clock input,
- * so channel 2 does the compare, with CCR2=0 so it matches when the counter
- * wraps to 0, which is the rising edge.
- *
- * It must be **TIM8 and DMA2**, not TIM3 and DMA1. GPIO lives on AHB1 and DMA1
- * cannot reach it: driving GPIOB->BSRR from DMA1 raises a transfer error on the
- * first word and the hardware disables the stream (measured: TEIF set, one
- * transfer, stream off). DMA2 is the one that can, which is why the test master
- * -- TIM1 on APB2, so DMA2 -- has always worked. TIM8 is the free APB2 timer.
- *
- * TIM8_CH2 -> DMA2 Stream 3, Channel 7 [RM0390 Rev 9 Table 29]. In this build
- * there is no SPI1, so streams 2 and 3 are free; ADC1 keeps stream 0.
- *
- * TI1F_ED is a channel-1 input, so the clock reaches TIM8_CH1 = PC6 on **AF3**
- * [DS Table 11], morpho CN10 pin 4. The same pad also carries TIM3_CH1 on AF2,
- * so this is a change of alternate function only -- the wire does not move.
+ * TIM8_CH1 = PC6 on AF3 [DS Table 11 p.60], morpho CN10 pin 4.
+ * TIM8_CH2 -> DMA2 Stream 3, Channel 7 [RM0390 Rev 9 Table 29]; ADC1 keeps
+ * stream 0.
  */
 #define SSI_CLKIN_GPIO           GPIOC
 #define SSI_CLKIN_PIN            GPIO_PIN_6
@@ -144,12 +99,10 @@
 #define SSI_EF_DMA_CHANNEL       7u
 #define SSI_DATA_BSRR            (&GPIOB->BSRR)
 
-#define SSI_MASTER_SPI           SPI2
 #define SSI_MASTER_SCK_GPIO      GPIOB
 #define SSI_MASTER_SCK_PIN       GPIO_PIN_10
 #define SSI_MASTER_MISO_GPIO     GPIOB
 #define SSI_MASTER_MISO_PIN      GPIO_PIN_14
-#define SSI_MASTER_AF            GPIO_AF5_SPI2
 
 #define ANGLE_ADC                ADC1
 #define ANGLE_ADC_GPIO           GPIOA

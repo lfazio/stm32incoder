@@ -1,14 +1,9 @@
 #include "ssi/ssi_master.h"
 #include "board/board.h"
 
-/* SPI2 lives on APB1, so its clock is PCLK1 = 45 MHz. The SSI clock window is
- * 100 kHz .. 2 MHz (section 5.4.1); with the SPI's power-of-two prescalers the
- * usable divisors are therefore 32 (1.406 MHz) through 256 (176 kHz). */
+/* The SSI clock window, section 5.4.1. */
 #define SSI_MASTER_MIN_HZ  100000u
 #define SSI_MASTER_MAX_HZ  2000000u
-
-static uint32_t s_clock_hz;
-static uint8_t  s_br;   /* CR1.BR field value */
 
 static void dwt_init(void)
 {
@@ -24,42 +19,6 @@ void ssi_master_delay_us(uint32_t us)
     while ((DWT->CYCCNT - start) < cycles) { }
 }
 
-/* Which edge this test master samples on has to follow the edge the slave
- * under test drives, or every frame reads back shifted by one bit.
- *
- *   slave drives on   master samples on   builds
- *   rising edge       falling edge        default, and SIMENC_RISING_EDGE
- *   falling edge      rising edge         SPI fallback (TIMER_DATA=OFF)
- *
- * A real SSI controller always samples on the falling edge; the rising-edge
- * case exists only because the SPI fallback drives DATA half a period early,
- * which is the deviation documented in the README. */
-#if defined(SIMENC_TIMER_DATA) || defined(SIMENC_RISING_EDGE)
-#define MASTER_SAMPLE_ON_FALLING 1
-#else
-#define MASTER_SAMPLE_ON_FALLING 0
-#endif
-
-static void spi_apply(void)
-{
-    SSI_MASTER_SPI->CR1 &= ~SPI_CR1_SPE;
-    /* Master, CPOL=1 so the clock idles HIGH as SSI requires, 8-bit, MSB
-     * first. CPOL=1 makes the leading edge of each bit period the falling one,
-     * so CPHA=0 samples on the fall and CPHA=1 on the rise -- see
-     * MASTER_SAMPLE_ON_FALLING.
-     *
-     * SSM=1 with SSI=1 holds the internal NSS high, which a master needs to
-     * avoid a mode fault. */
-    SSI_MASTER_SPI->CR1 = SPI_CR1_MSTR | SPI_CR1_CPOL
-#if !MASTER_SAMPLE_ON_FALLING
-                        | SPI_CR1_CPHA
-#endif
-                        | SPI_CR1_SSM | SPI_CR1_SSI
-                        | ((uint32_t)s_br << SPI_CR1_BR_Pos);
-    SSI_MASTER_SPI->CR2 = 0;
-    SSI_MASTER_SPI->CR1 |= SPI_CR1_SPE;
-}
-
 void ssi_master_init(void)
 {
     GPIO_InitTypeDef io = {0};
@@ -67,48 +26,21 @@ void ssi_master_init(void)
     dwt_init();
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_SPI2_CLK_ENABLE();
 
-    io.Pin       = SSI_MASTER_SCK_PIN;
-    io.Mode      = GPIO_MODE_AF_PP;
-    io.Pull      = GPIO_PULLUP;         /* SSI clock idles HIGH */
-    io.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
-    io.Alternate = SSI_MASTER_AF;
+    /* The clock pin is a plain GPIO output: TIM1 compare events drive it
+     * through DMA writes to BSRR. Hold it at the SSI idle level before the
+     * first burst so the slave sees no spurious edge. */
+    SSI_MASTER_SCK_GPIO->BSRR = SSI_MASTER_SCK_PIN;
+    io.Pin   = SSI_MASTER_SCK_PIN;
+    io.Mode  = GPIO_MODE_OUTPUT_PP;
+    io.Pull  = GPIO_PULLUP;             /* SSI clock idles HIGH */
+    io.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(SSI_MASTER_SCK_GPIO, &io);
 
     io.Pin  = SSI_MASTER_MISO_PIN;
+    io.Mode = GPIO_MODE_INPUT;
     io.Pull = GPIO_PULLUP;              /* DATA idles HIGH */
     HAL_GPIO_Init(SSI_MASTER_MISO_GPIO, &io);
-
-    s_br       = 4;                      /* /32 */
-    s_clock_hz = PCLK1_HZ >> (s_br + 1u);
-    spi_apply();
-}
-
-uint32_t ssi_master_set_clock(uint32_t requested_hz)
-{
-    for (uint8_t br = 0; br < 8u; br++) {
-        uint32_t hz = PCLK1_HZ >> (br + 1u);
-        if (hz > SSI_MASTER_MAX_HZ || hz < SSI_MASTER_MIN_HZ) {
-            continue;
-        }
-        if (hz <= requested_hz || s_clock_hz == 0u) {
-            s_br       = br;
-            s_clock_hz = hz;
-            spi_apply();
-            return s_clock_hz;
-        }
-    }
-    /* Nothing at or below the request is legal: fall back to the slowest. */
-    s_br       = 7;
-    s_clock_hz = PCLK1_HZ >> 8u;
-    spi_apply();
-    return s_clock_hz;
-}
-
-uint32_t ssi_master_get_clock(void)
-{
-    return s_clock_hz;
 }
 
 bool ssi_master_data_idle_high(void)
@@ -128,13 +60,14 @@ bool ssi_master_data_idle_high(void)
  *
  * The pulse count is exactly the DMA transfer count, so the burst stops itself
  * after n edges and leaves the line HIGH -- no software has to chase the timer.
- * Streams 0/2/3 of DMA2 are already taken by ADC1 and SPI1, hence 1/4/6.
+ * Streams 0/3/7 of DMA2 are taken by ADC1 and the slave's DATA path, hence
+ * 1/4/6.
  */
 #define X_TIM            TIM1
 #define X_DMA_CHANNEL    6u
 
 /* The clock is TIM1's period, so any rate of the form 180 MHz / N is reachable
- * rather than only the SPI baud generator's powers of two. N is bounded by the
+ * N is bounded by the
  * SSI window itself: N = 90 is 2.000 MHz and N = 1800 is 100.0 kHz.
  *
  * Resolution is set by N being an integer, so it is coarsest at the top of the
@@ -231,18 +164,15 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     __HAL_RCC_TIM1_CLK_ENABLE();
     __HAL_RCC_DMA2_CLK_ENABLE();
 
-    /* Take the clock pin away from SPI2 and hold it at the idle HIGH level
-     * before anything else, so the slave sees no spurious edge. */
+    /* Hold the clock at its idle HIGH level before anything else, so the
+     * slave sees no spurious edge. The pin is already a GPIO output. */
     GPIOB->BSRR = SSI_MASTER_SCK_PIN;
-    uint32_t moder_save = GPIOB->MODER;
-    GPIOB->MODER = (moder_save & ~(3u << (10u * 2u))) | (1u << (10u * 2u));
 
     X_TIM->CR1  = 0;
     X_TIM->PSC  = 0;
     X_TIM->ARR  = s_x_n - 1u;
     X_TIM->CCR1 = 1u;                /* falling edge, start of period */
     X_TIM->CCR3 = (s_x_n / 2u) + 1u; /* rising edge, half a period later */
-#if MASTER_SAMPLE_ON_FALLING
     /* Late in the high phase, just before the next falling edge, which is
      * where an SSI controller reads: the bit was set on the rising edge and
      * stays valid across the fall.
@@ -255,11 +185,6 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
      * bit, making `fixed` and `ramp` read back (value >> 1) with ZPD shifted
      * into the top: 0x5A5A5 came out as 447186. */
     X_TIM->CCR4 = s_x_n - 2u;
-#else
-    /* The SPI fallback drives DATA on the falling edge, so the bit is already
-     * up by the rising edge and this samples in its stable window. */
-    X_TIM->CCR4 = (s_x_n / 2u) + 2u;
-#endif
     X_TIM->CCMR1 = 0;          /* channels as output compare, frozen: the
                                 * compare flags still fire, and no pin is
                                 * driven by the timer itself */
@@ -308,9 +233,8 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
 
     bool complete = (guard <= 200000u);
 
-    /* Leave the line HIGH and give the pin back to SPI2. */
+    /* Leave the line at the SSI idle level. */
     GPIOB->BSRR  = SSI_MASTER_SCK_PIN;
-    GPIOB->MODER = moder_save;
 
     if (!complete) {
         return false;
@@ -327,77 +251,14 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     return true;
 }
 
-/* Time PB10 -> pin, in DWT cycles, as the median of several tries. Each try
- * drives the clock pin low, settles, then drives it high and spins on IDR. */
-static uint32_t edge_delay_cycles(volatile uint32_t *idr, uint32_t mask)
-{
-    uint32_t best[9];
-
-    for (uint32_t k = 0; k < 9u; k++) {
-        GPIOB->BSRR = (uint32_t)SSI_MASTER_SCK_PIN << 16u;
-        ssi_master_delay_us(20);
-
-        uint32_t t0 = DWT->CYCCNT;
-        GPIOB->BSRR = SSI_MASTER_SCK_PIN;
-        uint32_t guard = 0;
-        while (((*idr) & mask) == 0u && guard < 4000u) {
-            guard++;
-        }
-        best[k] = DWT->CYCCNT - t0;
-    }
-    /* median of 9, by selection -- no sorting library and none needed */
-    for (uint32_t i = 0; i < 5u; i++) {
-        uint32_t m = i;
-        for (uint32_t j = i + 1u; j < 9u; j++) {
-            if (best[j] < best[m]) { m = j; }
-        }
-        uint32_t t = best[i]; best[i] = best[m]; best[m] = t;
-    }
-    return best[4];
-}
-
-void ssi_clock_skew(uint32_t *pb3_ns, uint32_t *pc6_ns)
-{
-    EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
-    EXTI->PR   = SSI_SLAVE_SCK_PIN;
-
-    uint32_t moder_save = GPIOB->MODER;
-    uint32_t odr_save   = GPIOB->ODR;
-
-    uint32_t m = moder_save & ~(3u << (10u * 2u));
-    m |= (1u << (10u * 2u));                 /* PB10 push-pull output */
-    GPIOB->MODER = m;
-
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-
-    uint32_t c_pb3 = edge_delay_cycles(&GPIOB->IDR, SSI_SLAVE_SCK_PIN);
-    uint32_t c_pc6 = edge_delay_cycles(&GPIOC->IDR, GPIO_PIN_6);
-
-    GPIOB->ODR   = odr_save;
-    GPIOB->MODER = moder_save;
-
-    /* Scale before dividing: 1000/(180e6/1e6) truncates to 5 instead of 5.56. */
-    *pb3_ns = (c_pb3 * 1000u) / (SYSCLK_HZ / 1000000u);
-    *pc6_ns = (c_pc6 * 1000u) / (SYSCLK_HZ / 1000000u);
-}
-
 bool ssi_loopback_check(bool *clock_ok, bool *data_ok)
 {
     const uint32_t drive = SSI_MASTER_SCK_PIN | SSI_SLAVE_DATA_PIN;
 
-    /* Silence the slave's first-edge handover first. Driving the clock pin low
-     * here looks exactly like the start of a Read Cycle, and EXTI3_IRQHandler
-     * would rewrite GPIOB->MODER underneath this test -- putting PB10 back into
-     * alternate-function mode, so the pin would stop following ODR and every
-     * wire would be misreported as OPEN. ssi_slave_start() re-arms it. */
-    EXTI->IMR &= ~SSI_SLAVE_SCK_PIN;
-    EXTI->PR   = SSI_SLAVE_SCK_PIN;
-
     uint32_t moder_save = GPIOB->MODER;
     uint32_t odr_save   = GPIOB->ODR;
 
-    /* PB10 and PB4 as push-pull outputs; PB3/PB14 stay as they are and are
+    /* PB10 and PB4 as push-pull outputs; PC6/PB14 stay as they are and are
      * simply sampled through IDR, which reads the pad in any mode. */
     uint32_t m = moder_save;
     m &= ~((3u << (10u * 2u)) | (3u << (4u * 2u)));
@@ -414,7 +275,9 @@ bool ssi_loopback_check(bool *clock_ok, bool *data_ok)
         uint32_t idr  = GPIOB->IDR;
         bool     want = (lvl != 0u);
 
-        if (((idr & SSI_SLAVE_SCK_PIN) != 0u) != want) {
+        /* The clock is checked at PC6, which is the pin that matters: it is
+         * what clocks TIM8 and therefore what shifts DATA out. */
+        if (((SSI_CLKIN_GPIO->IDR & SSI_CLKIN_PIN) != 0u) != want) {
             ck = false;
         }
         if (((idr & SSI_MASTER_MISO_PIN) != 0u) != want) {
@@ -428,30 +291,4 @@ bool ssi_loopback_check(bool *clock_ok, bool *data_ok)
     *clock_ok = ck;
     *data_ok  = dt;
     return ck && dt;
-}
-
-bool ssi_master_read(uint8_t n_bits, uint32_t *raw)
-{
-    if ((n_bits % 8u) != 0u || n_bits > 32u) {
-        return false;
-    }
-    if (!ssi_master_data_idle_high()) {
-        return false;
-    }
-
-    uint8_t  nbytes = (uint8_t)(n_bits / 8u);
-    uint32_t value  = 0;
-
-    /* Writing a byte is what produces 8 clock pulses; the byte value itself is
-     * irrelevant because the slave ignores MOSI. */
-    for (uint8_t i = 0; i < nbytes; i++) {
-        while (!(SSI_MASTER_SPI->SR & SPI_SR_TXE)) { }
-        *(volatile uint8_t *)&SSI_MASTER_SPI->DR = 0xFFu;
-        while (!(SSI_MASTER_SPI->SR & SPI_SR_RXNE)) { }
-        value = (value << 8u) | *(volatile uint8_t *)&SSI_MASTER_SPI->DR;
-    }
-    while (SSI_MASTER_SPI->SR & SPI_SR_BSY) { }
-
-    *raw = value;
-    return true;
 }
