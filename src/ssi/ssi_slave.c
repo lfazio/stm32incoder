@@ -416,6 +416,31 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     return true;
 }
 
+void ssi_slave_stop(void)
+{
+    /* Park the transport so something else can borrow the DATA pin.
+     *
+     * The loopback continuity test drives PB4 and toggles the clock pin, and
+     * the clock reaches PC6 -- so without this, TIM8 counts those edges and the
+     * DATA DMA writes PB4 from under the test, which reports the wire OPEN when
+     * it is fine. The old SPI path had the same hazard through EXTI3 and masked
+     * it the same way. */
+    CLK_TIM->CR1  &= ~TIM_CR1_CEN;
+    CLK_TIM->DIER  = 0;
+    CLK_TIM->SR    = 0;
+
+    SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
+    SSI_EF_DMA_STREAM->CR   &= ~DMA_SxCR_EN;
+    while ((SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) ||
+           (SSI_EF_DMA_STREAM->CR & DMA_SxCR_EN)) {
+    }
+
+    GAP_TIM->CR1 &= ~TIM_CR1_CEN;
+    GAP_TIM->SR   = 0;
+
+    s_armed = false;
+}
+
 void ssi_slave_start(void)
 {
     data_drive(true);

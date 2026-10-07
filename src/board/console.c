@@ -170,12 +170,10 @@ static void cmd_stat(void)
     trace_printf("data_line_idle_high=%u  measured_T=%luns\r\n",
                  (unsigned)ssi_master_data_idle_high(),
                  (unsigned long)ss.period_ns);
-#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
     /* Names the missing wire rather than leaving a dead link unexplained. */
-    trace_printf("eom=clock-counter etr=%s\r\n",
+    trace_printf("clock in PC6: %s\r\n",
                  ssi_slave_clock_counter_ok() ? "counted n"
-                                              : "NEVER REACHED n - check PD2");
-#endif
+                                              : "NEVER REACHED n - check CN10-4");
 }
 
 static void cmd_read(uint32_t count)
@@ -339,6 +337,7 @@ static void handle_line(char *line)
     } else if (strcmp(cmd, "wire") == 0) {
         bool ck = false;
         bool dt = false;
+        ssi_slave_stop();       /* the test needs the DATA pin to itself */
         bool ok = ssi_loopback_check(&ck, &dt);
 
         trace_printf("CLOCK PB10(CN10-25,D6) -> PC6(CN10-4)   : %s\r\n",

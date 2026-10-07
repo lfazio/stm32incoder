@@ -182,13 +182,25 @@ void position_source_set_ramp_step(int32_t counts_per_update)
     s_ramp_step = counts_per_update;
 }
 
-uint16_t position_source_raw_adc(void)
+/* Sum of the averaging window, 0 .. ADC_AVG_SAMPLES * 4095.
+ *
+ * Kept un-divided on purpose. Dividing down to 12 bits first throws away
+ * whatever the oversampling bought, and it is the sum that gets scaled into
+ * the position field. */
+static uint32_t adc_sum(void)
 {
     uint32_t sum = 0;
     for (uint32_t i = 0; i < ADC_AVG_SAMPLES; i++) {
         sum += s_samples[i];
     }
-    return (uint16_t)(sum / ADC_AVG_SAMPLES);
+    return sum;
+}
+
+#define ADC_SUM_FULL_SCALE  (ADC_AVG_SAMPLES * 4095u)
+
+uint16_t position_source_raw_adc(void)
+{
+    return (uint16_t)(adc_sum() / ADC_AVG_SAMPLES);
 }
 
 void position_source_tick(void)
@@ -206,9 +218,36 @@ uint32_t position_source_read(void)
     case POS_SRC_RAMP:
         return s_ramp;
     case POS_SRC_ADC:
-    default:
-        return ((uint32_t)position_source_raw_adc() << (s_pos_bits - 12u))
-               & s_pos_mask;
+    default: {
+        /* Scale the acquisition across the whole position field.
+         *
+         * This used to be `avg12 << (bits - 12)`, which has two faults. Full
+         * scale landed on 524160 rather than 524287, so the top 127 counts
+         * were unreachable and the transfer function had a gain error of one
+         * ADC LSB; and the low bits were always zero, because the sum had
+         * already been divided back down to 12 bits.
+         *
+         * Scaling the *sum* fixes both: 0 maps to 0 and full scale maps to
+         * exactly s_pos_mask, for any position width, and the quantisation
+         * step is the sum's, not the average's.
+         *
+         * Be clear about what this is and is not. It makes the emulator use
+         * the IncOder's full 19-bit (or 22-bit) numeric range, which is what
+         * a controller expects to see. It does not create 19 bits of real
+         * measurement: the source is a 12-bit ADC, and averaging 12 samples
+         * is worth about 1.8 bits more (sqrt(12)) and only when the input
+         * carries enough noise to dither. Reaching 19 honest bits would need
+         * 4^7 = 16384 samples per update, which does not fit a 100 us period.
+         *
+         * 64-bit because the product overflows 32: 49140 * 524287 = 2.6e10.
+         * This runs in the 10 kHz update tick, not on the SSI path. */
+        uint32_t sum = adc_sum();
+        if (sum > ADC_SUM_FULL_SCALE) {
+            sum = ADC_SUM_FULL_SCALE;       /* cannot happen; cheap guard */
+        }
+        return (uint32_t)(((uint64_t)sum * (uint64_t)s_pos_mask)
+                          / (uint64_t)ADC_SUM_FULL_SCALE);
+    }
     }
 }
 

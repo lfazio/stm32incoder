@@ -235,14 +235,29 @@ Watch integer truncation in that arithmetic: `1000/(SYSCLK_HZ/1000000)` is 5,
 not 5.56, which reported every period 10% short until it was caught against the
 analyser. Scale before dividing.
 
-**Not yet re-verified on hardware**: the SPI removal itself, and the test
-master's sampling-edge fix that preceded it. Both were done with the board
-disconnected. Everything above was measured before those changes.
+**Re-verified on hardware after the SPI removal** (a different board; ST-LINK
+serial 066DFF555670655067161435, only one adapter attached so no `adapter
+serial` pin is needed):
 
-**Worth re-checking when hardware is back**: the Error Flag buffer has n+1
-entries -- n no-ops then the flag -- but the test master emits exactly n falling
-edges per Read Cycle (CC1 once per period, n periods). If that reading is right
-the flag entry is never reached and the gap holds D0 instead. The earlier
-"0/197 gaps opening HIGH" could have been a false pass if D0 happened to be 0
-throughout. Re-measure deliberately with `err on` and a `fixed` value whose LSB
-is 1.
+  wire                  CLOCK PB10->PC6 OK, DATA PB4->PB14 OK
+  fixed 0x5A5A5         reads back 370085 at 100k/250k/500k/1M/1.5M/2M
+  burst 200 50          ok=198 bad=0 at every one of those rates
+  all five variants     98/98 at 500 kHz, ssi2 and ssi6 included
+  err on                98/98 with PV=0
+  measured_T            1996 ns at 500 kHz -- the dynamic Tmu correction is
+                        live again (it read 0 ns while the measurement was
+                        orphaned on the deleted SPI receive DMA)
+
+ssi2 and ssi6 passing is the useful signal: they are the only variants with an
+integrity check, and they failed before precisely because a one-bit shift
+breaks parity and CRC where it merely relabels a plain position field.
+
+**Still not measured on an analyser since the SPI removal** -- the `logic2` MCP
+was down. The edge placement and the Error Flag's hardware slot are unverified
+against a capture; the loopback only proves framing and payload.
+
+**Still open**: the Error Flag buffer has n+1 entries (n no-ops then the flag)
+but the test master emits exactly n falling edges per Read Cycle. If that
+reading is right the flag entry is never reached and the gap holds D0 instead.
+An earlier "0/197 gaps opening HIGH" could have been a false pass if D0 was 0
+throughout. Needs an analyser with `err on` and a `fixed` value whose LSB is 1.

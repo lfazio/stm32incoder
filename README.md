@@ -581,9 +581,17 @@ requests land on DMA2. No SPI is involved anywhere, at either end of the link.
 
   Scale a 5 V source with a divider instead, keeping the source impedance under
   the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives 5 V → 3.31 V at ~3.4 kΩ.
-- **Analog → angle mapping.** 0 V…VDDA maps linearly onto 0…524287 counts
-  (0…360°). The ADC is 12-bit, so an analog-driven position moves in steps of
-  128 counts even though the SSI4 field is 19-bit.
+- **Analog → angle mapping.** 0 V…VDDA maps linearly onto the full position
+  field — 0…524287 counts for SSI4's 19 bits, 0…4194303 for the 22-bit
+  variants, both endpoints exact. The oversampled *sum* is what gets scaled,
+  not the 12-bit average, so the averaging gain is not thrown away first.
+
+  That spans the IncOder's numeric range but does not manufacture its
+  precision: the source is a 12-bit ADC, and averaging 12 samples is worth
+  about 1.8 bits more (√12), and only where the input carries enough noise to
+  dither. Honest 19-bit acquisition would need 4⁷ = 16384 samples per update,
+  which does not fit a 100 µs period. A real IncOder gets its resolution from
+  the inductive front end, not from an ADC like this one.
 - **19-bit resolution.** SSI4 caps measurement resolution at 19 bits, so the
   emulator presents the maximum the variant allows.
 - **Update rate 10 kHz.** The guide specifies "< 0.1 ms"; 100 µs is the fastest

@@ -61,6 +61,12 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
  * message out. */
 void ssi_slave_start(void);
 
+/* Parks the transport: stops the clock counter and both DATA DMA streams so
+ * something else can drive the DATA pin. Call ssi_slave_start() to resume.
+ * Needed by the loopback continuity test, which would otherwise race the DMA
+ * for the pin it is trying to measure. */
+void ssi_slave_stop(void);
+
 /* Changes the message length, for switching SSI payload variant. Disarms,
  * reconfigures and re-arms; n_bits must still be a multiple of 8 and <= 32. */
 bool ssi_slave_set_frame_bits(uint8_t n_bits);
@@ -71,15 +77,14 @@ void ssi_slave_poll(void);
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out);
 
-#if defined(SIMENC_CLOCK_COUNTER) || defined(SIMENC_TIMER_DATA)
-/* True once the external clock counter has actually reached n and ended a
- * message. It counts the clock on a second pad (TIM3_ETR, PD2 / CN7-4), and if
- * that wire is missing the counter never reaches n, no message ever ends and
- * the link is simply dead -- a symptom with nothing pointing at its cause.
- * `stat` reports this so the missing wire names itself. Reaching n is the
- * property worth reporting: a floating input picks up enough noise to make
- * "saw an edge" true while the link stays dead. */
+/* True once the clock counter has actually reached n and ended a message.
+ *
+ * The clock arrives on PC6 (TIM8_CH1, morpho CN10-4) and is what shifts DATA
+ * out; without that wire the counter never reaches n, no message ever ends and
+ * the link is simply dead -- a symptom with nothing pointing at its cause, so
+ * `stat` reports it. Reaching n is the property worth reporting: a floating
+ * input picks up enough noise to make "saw an edge" true while the link stays
+ * dead. */
 bool ssi_slave_clock_counter_ok(void);
-#endif
 
 #endif /* SIMENC_SSI_SLAVE_H */
