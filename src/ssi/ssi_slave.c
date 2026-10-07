@@ -26,7 +26,12 @@
  * actually going high. Measured at ~1.6 us, from two captures that agree --
  * 20.89 us at 2 MHz (half period 0.25 us) and 20.85 us at 175.8 kHz (half
  * period 2.89 us), each against a 20 us target. */
-#define GAP_ISR_OVERHEAD_NS  1600u
+/* Fixed part of the correction: the latency of the two interrupts the gap now
+ * costs -- end-of-message to the stage-1 timer start, and the stage-1 update to
+ * DATA actually moving -- plus the stage-2 update to DATA going high. Retuned
+ * from 1600 ns when the gap gained its second stage: with the old value Tmu ran
+ * 21.05 us at 500 kHz and 21.60 us at 2 MHz, against a 20 +/- 1 us window. */
+#define GAP_ISR_OVERHEAD_NS  2600u
 
 /* Lower bound, so a pathologically slow master cannot drive the gap to zero. */
 #define GAP_MIN_NS           1000u
@@ -43,6 +48,8 @@ static volatile uint16_t     s_last_ndtr;
 static volatile uint32_t     s_frames;
 static volatile uint32_t     s_resyncs;
 static volatile bool         s_gap_level;
+/* 1 = waiting to place the Error Flag, 2 = waiting out the rest of Tmu. */
+static volatile uint8_t      s_gap_stage;
 
 /* Dynamic half-period correction.
  *
@@ -287,15 +294,6 @@ void DMA2_Stream3_IRQHandler(void)
     }
 
     if (DMA2->LISR & DMA_LISR_TCIF3) {
-        /* Error Flag first, before anything else in this handler.
-         *
-         * Until this store lands the line still carries D0, so when D0 is 1
-         * the gap opens with a spurious HIGH pulse -- a controller reading the
-         * flag early sees an error that is not there. Every instruction ahead
-         * of it widens that pulse, so the period arithmetic and the teardown
-         * both wait. */
-        data_drive(s_gap_level);
-
         uint32_t elapsed = DWT->CYCCNT - s_t_half;
 
         /* Stop the request source in the same breath as ending the message, so
@@ -303,22 +301,17 @@ void DMA2_Stream3_IRQHandler(void)
         CLK_TIM->CR1  &= ~TIM_CR1_CEN;
         CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
 
-        /* On the Error Flag, driven above.
+        /* The Error Flag is not placed here -- the gap timer does it, see
+         * gap_timer_start(). Driving it in this handler puts it on the line a
+         * fixed ~0.4 us after the last rising edge, which is too early at
+         * every rate below about 1 MHz and destroys the last data bit.
          *
-         * It was briefly placed by a second DMA on a channel-4 compare, one
-         * word per falling edge from a buffer of n no-ops followed by the
-         * flag. That cannot work: the flag sits at index n, so it needs an
-         * (n+1)'th falling edge, and a Read Cycle of n clock periods only has
-         * n. Measured on the analyser, the gap then held the stale last data
-         * bit and did not track PV at all -- with PV=0 it read LOW in 182 of
-         * 197 cycles. No controller can supply that extra edge, so the idea is
-         * wrong rather than merely unlucky; placing the flag in hardware needs
-         * a timer, not a clock edge. See the README.
-         *
-         * This costs the interrupt latency the DMA was meant to avoid -- the
-         * flag lands a few hundred ns after the last rising edge instead of on
-         * it -- but it is the correct level, which the DMA version never
-         * reached. */
+         * It was also tried as a second DMA on a channel-4 compare, one word
+         * per falling edge from a buffer of n no-ops then the flag. That
+         * cannot work either: the flag sits at index n, so it needs an
+         * (n+1)'th falling edge, and a Read Cycle of n clock periods has n.
+         * Measured, the gap then held the stale last data bit and did not
+         * track PV at all -- with PV=0 it read LOW in 182 of 197 cycles. */
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
         DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
         /* The interval spans however many rising edges remained after the
@@ -361,23 +354,47 @@ static void gap_timer_init(void)
 
 /* Programs the gap so that DATA returns HIGH one Tmu after the last *falling*
  * edge, given the clock period measured during this frame. */
+/* Floor for the short first stage. GAP_MIN_NS is the floor for the whole gap
+ * and is far too coarse here: at 2 MHz three quarters of a period is 375 ns,
+ * and clamping that up to 1 us pushed Tmu 0.6 us long on its own. */
+#define GAP_STAGE_MIN_NS  200u
+
+static inline void gap_timer_fire_in(uint32_t ns, uint32_t floor_ns)
+{
+    if (ns < floor_ns) {
+        ns = floor_ns;
+    }
+    GAP_TIM->ARR  = (ns / GAP_TICK_NS) - 1u;
+    GAP_TIM->CNT  = 0;
+    GAP_TIM->SR   = 0;
+    GAP_TIM->CR1 |= TIM_CR1_CEN;
+}
+
+/* How long after the last rising edge the Error Flag may take the line.
+ *
+ * Not a constant. The controller samples the last data bit D0 in the phase
+ * that follows the edge that set it -- half a clock period later -- so a fixed
+ * delay is right at one rate and wrong at every other. Measured at 500 kHz, a
+ * fixed 416 ns put the flag on the line 567 ns before the test master sampled
+ * D0, and `fixed 0x3FFFFF` in SSI1 (where D0 is PD[0], unlike SSI4 where it is
+ * the near-constant TS[0]) read back 0x3FFFFE every frame: the last bit was
+ * being destroyed in every message.
+ *
+ * Three quarters of a period clears the sampling point by a comfortable margin
+ * at every rate in the window, and still leaves the flag on the line for the
+ * rest of Tmu. */
+static inline uint32_t flag_delay_ns(void)
+{
+    uint32_t t = s_period_valid ? s_period_ns : 500u;   /* assume 2 MHz first */
+    return (t * 3u) / 4u;
+}
+
+/* Stage 1 of the gap: wait out the sampling window, then let the Error Flag
+ * take the line. The remainder of Tmu is stage 2, in the handler. */
 static void gap_timer_start(void)
 {
-    uint32_t want = s_cfg.tmu_us * 1000u;
-    uint32_t sub  = GAP_ISR_OVERHEAD_NS;
-
-    if (s_period_valid) {
-        sub += s_period_ns / 2u;          /* the half clock period */
-    } else {
-        sub += 250u;                      /* first frame: assume 2 MHz */
-    }
-
-    uint32_t ns = (want > sub + GAP_MIN_NS) ? (want - sub) : GAP_MIN_NS;
-
-    GAP_TIM->ARR = (ns / GAP_TICK_NS) - 1u;
-    GAP_TIM->CNT = 0;
-    GAP_TIM->SR  = 0;
-    GAP_TIM->CR1 |= TIM_CR1_CEN;
+    s_gap_stage = 1u;
+    gap_timer_fire_in(flag_delay_ns(), GAP_STAGE_MIN_NS);
 }
 
 bool ssi_slave_init(const ssi_slave_config_t *cfg,
@@ -426,6 +443,7 @@ void ssi_slave_stop(void)
 
     GAP_TIM->CR1 &= ~TIM_CR1_CEN;
     GAP_TIM->SR   = 0;
+    s_gap_stage   = 0u;
 
     s_armed = false;
 }
@@ -503,11 +521,31 @@ bool ssi_slave_clock_counter_ok(void)
  * new Read Cycle may start. */
 void TIM6_DAC_IRQHandler(void)
 {
-    if (GAP_TIM->SR & TIM_SR_UIF) {
-        GAP_TIM->SR = 0;
-
-        data_drive(true);
-        stage_frame();
-        ssi_arm();
+    if ((GAP_TIM->SR & TIM_SR_UIF) == 0u) {
+        return;
     }
+    GAP_TIM->SR = 0;
+
+    if (s_gap_stage == 1u) {
+        /* The controller has had its half period to sample D0; the line is the
+         * Error Flag's now. */
+        data_drive(s_gap_level);
+        s_gap_stage = 2u;
+
+        /* Tmu is specified from the last *falling* edge, which is half a clock
+         * period before the last rising edge this gap started from. Subtract
+         * that, the delay just spent, and the fixed interrupt overhead. */
+        uint32_t want = s_cfg.tmu_us * 1000u;
+        uint32_t sub  = GAP_ISR_OVERHEAD_NS + flag_delay_ns()
+                      + (s_period_valid ? s_period_ns / 2u : 250u);
+        gap_timer_fire_in((want > sub + GAP_MIN_NS) ? (want - sub) : GAP_MIN_NS,
+                          GAP_MIN_NS);
+        return;
+    }
+
+    /* Tmu elapsed: DATA returns HIGH and a new Read Cycle may start. */
+    s_gap_stage = 0u;
+    data_drive(true);
+    stage_frame();
+    ssi_arm();
 }

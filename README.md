@@ -396,8 +396,8 @@ Measured on the analyser at 500 kHz, 198 cycles:
 | **DATA after its rising edge** | **+56 ns**, 3720/3720 |
 | **DATA moves between F1 and R1** | **0 / 198** |
 | Payload sampled at the falling edge | **197 / 197 correct** |
-| Tmu | 20.10–20.19 µs |
-| Gaps opening with a stale-D0 pulse | **98 / 197** — see the Error Flag below |
+| Tmu | 20.01–20.17 µs |
+| Last data bit D0 survives to be sampled | yes — see the Error Flag below |
 
 The +56 ns is 2.8 % of a bit period at 500 kHz and 22 % at 2 MHz, so the bit is
 settled long before the controller samples it on the following falling edge.
@@ -422,44 +422,53 @@ it captured the *previous* bit, and `fixed 0x5A5A5` read back as 447186 —
 `(pd >> 1) | (ZPD << 18)` exactly.
 
 
-### KNOWN DEVIATION — the Error Flag is late
+### The Error Flag, and the last data bit
 
 §5.4.1 note 3 hands the data line to the Error Flag after the last rising edge.
-The emulator gets the **level** right and the **timing** wrong: measured at
-500 kHz over 197 cycles, the flag lands **416 ns after the last rising edge**
-(400–528). Until that store reaches the pin the line still carries D0, so on the
-cycles where D0 happens to be 1 — about half of them, 98 of 197 — the gap
-**opens with a spurious HIGH pulse** while PV=1 says it must be LOW throughout.
-A controller sampling the Error Flag immediately would read an error that is not
-there.
+Taken literally that is unimplementable: the last data bit D0 is *written* on
+that same edge, and a controller samples it in the phase that follows. Place
+the flag at R(n) and D0 is never visible.
 
-The level itself is correct in every cycle, and that is worth stating because an
-earlier attempt got it wrong in a way that looked right:
+That is not hypothetical — it was the behaviour, and it destroyed a bit in every
+frame. With the flag driven from the end-of-message interrupt at a fixed ~416 ns,
+it landed 567 ns *before* the controller sampled D0 at 500 kHz. In SSI4 this
+hid, because there D0 is TS[0], which is near-constant, and the flag is usually
+0 as well. SSI1 exposes it, because there D0 is PD[0]:
 
-| Error Flag driven by | gap tracks PV? | measured |
+```
+ssi 1 ; fixed 0x3FFFFF     ->  reads back 4194302      bit 0 lost, every frame
+```
+
+**The flag is therefore placed by the gap timer, three quarters of a clock
+period after the last rising edge**, which clears the sampling point at every
+rate in the window. TIM6 now runs the gap in two stages: fire once to hand the
+line to the Error Flag, then again for the remainder of Tmu.
+
+| | before | now |
 |---|---|---|
-| CC4 DMA at a falling edge | **no** | PV=0 read LOW in **182 / 197** cycles |
-| end-of-message interrupt | yes | 197/197 at PV=1 *and* PV=0, 416 ns late |
+| `ssi 1 ; fixed 0x3FFFFF` | 4194302 | **4194303** at 100 kHz, 500 kHz and 2 MHz |
+| Flag level tracks PV | yes | yes, 197/197 at PV=1 and PV=0 |
+| R(n) → flag on the line | 416 ns fixed | 3336 ns at 500 kHz, scaling with T |
 
-**Why the hardware version could not work.** The idea was a second DMA on a
-channel-4 compare, one word per falling edge from a buffer of n no-ops followed
-by the flag — `BSRR` ignores a zero word, so only the last entry would move the
-line. But that entry sits at index n and therefore needs an **(n+1)'th falling
-edge**, and a Read Cycle of n clock periods has exactly **n**. The captures
-confirm 32 falling edges per cycle. No controller can supply the extra edge, so
-this is wrong in principle rather than unlucky, and it was removed.
+The delay has to scale with T, which is the whole point: a fixed value is right
+at one rate and wrong at every other. At 100 kHz the sampling point is 5 µs out,
+at 2 MHz it is 250 ns.
 
-It also failed *silently*: the gap simply held the stale last data bit, which
-for a `fixed` payload is nearly constant, so a check that only looked for extra
-rising transitions reported a clean 0/197. The test that actually catches it is
-comparing the gap level between PV=1 and PV=0 — if the flag is not driven, the
-level does not change.
+**Residual deviation.** The flag takes the line later than note 3 asks — about
+1.8 µs of fixed two-interrupt latency plus 0.75·T. It is present for the rest of
+Tmu (roughly 15.7 µs of the 19 µs window at 500 kHz) and the level is right in
+every cycle, but a controller sampling the flag immediately after the last
+rising edge would still see the last data bit. Closing that gap entirely means
+placing the flag by DMA, and that is not reachable here: DMA1 cannot write GPIO
+(it is on AHB1), only TIM1 and TIM8 reach DMA2, TIM9–11 have no DMA at all, TIM8
+is the bit shifter with `ARR=1` so it has no sub-period compare left, and TIM1
+is the test master.
 
-**Placing it in hardware needs a timer, not a clock edge**, since the last data
-bit is written on the last edge the cycle has. A timer in reset-slave mode off
-the clock would fire once the clock stops and could drive the write by DMA, but
-it needs the clock on a second pin — the arrangement that was just removed
-because one pin per clock is simpler and avoids the skew trap. Unresolved.
+A second DMA on a falling-edge compare was tried and is wrong in principle: the
+flag would sit at buffer index n and so need an (n+1)'th falling edge, which a
+Read Cycle of n clock periods does not have. It failed silently — the gap simply
+held the stale last data bit — and the check that catches that is comparing the
+gap level between PV=1 and PV=0, not looking for extra transitions.
 
 ## Measured against the specification
 
@@ -509,8 +518,11 @@ measures like any other rate.
 | DATA after its rising edge | +56 ns, 3724/3724 | +56 ns, 3734/3734 |
 | — as a fraction of the half period | 2.8 % | 22 % |
 | DATA moves between F1 and R1 | 0 | 0 |
-| Tmu (spec 20 µs ± 1) | 20.10–20.19 µs | 20.14–20.24 µs |
-| Gaps opening with a stale-D0 pulse | 98 / 197 | 95 / 197 |
+| Tmu (spec 20 µs ± 1) | 20.01–20.17 µs | 19.97–20.12 µs |
+
+Also measured at 100 kHz, the other end of the window: 32 clocks, +56 ns,
+197/197, Tmu 20.02–20.19 µs. All three rates sit inside 20 ± 1 µs from the same
+dynamic correction, across a 20× span of clock period.
 
 Both Tmu figures land inside the window from the same dynamic correction, which
 is the point of measuring `T` per frame rather than assuming it: the half-period
