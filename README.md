@@ -388,7 +388,15 @@ What this buys, structurally rather than by tuning:
 
 ![One Read Cycle with DATA shifted by the clock](docs/img/ssi4-500khz-timer.svg)
 
-Measured on the analyser at 500 kHz, 198 cycles:
+One complete Read Cycle, captured on the current build. The faint rules are the
+clock's **rising** edges, one per bit; every DATA transition sits just after one
+of them. The SSI4 fields are banded over the bit cells, and the caption's values
+are decoded from the capture itself rather than copied in. The green rule is the
+first falling edge, which starts the cycle and carries no data; the purple one
+is where the Error Flag takes the line, three quarters of a period after the
+last rising edge so the controller has sampled D0 first.
+
+Measured on the analyser at 500 kHz, 197 cycles:
 
 | | result |
 |---|---|

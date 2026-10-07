@@ -26,11 +26,18 @@ def cycles_of(rows):
     cyc.append(cur);return cyc
 
 rows=load(sys.argv[1]); out=sys.argv[2]
-cyc=cycles_of(rows); c=cyc[5]
+cyc=cycles_of(rows)
 dt=[r[0] for r in rows]
 def val(t,ch):
     i=max(bisect.bisect_right(dt,t)-1,0)
     return rows[i][1] if ch==0 else rows[i][2]
+# Prefer a frame whose last data bit is 1: that is the one where the handover
+# to the Error Flag is actually visible, rather than both happening to be 0.
+c=cyc[5]
+for cand in cyc[4:-3]:
+    Tc=(cand[-1]-cand[0])/(len(cand)-1)
+    if val(cand[-1]+Tc*0.75, 1) == 1:
+        c=cand; break
 
 T=(c[-1]-c[0])/(len(c)-1)                      # clock period, measured
 # Where in the bit cell to sample depends on which edge the encoder drives on.
@@ -61,19 +68,21 @@ pv=(raw>>31)&1; zpd=(raw>>30)&1; pd=(raw>>11)&0x7FFFF; ts=raw&0x7FF
 # interrupt pulls it down, which shows as a pulse at the start of the gap. That
 # is a real defect, not a plotting artefact -- it is annotated below rather than
 # skipped over.
+nxt_cycle = cyc[cyc.index(c)+1][0]
 tmu=None; i=bisect.bisect_right(dt,c[-1]); stale=None
-while i<len(rows) and dt[i]<cyc[6][0]:
+while i<len(rows) and dt[i]<nxt_cycle:
     if rows[i][2]==1 and rows[i-1][2]==0:
         if tmu is not None or stale is None: stale = dt[i] if tmu is None else stale
         tmu=dt[i]
     i+=1
-# the stale-bit pulse: line high at the last clock, dropping later in the gap
-pulse=None
-if val(c[-1] + T*0.6, 1) == 1:
-    j=bisect.bisect_right(dt,c[-1])
-    while j<len(rows) and dt[j]<cyc[6][0]:
-        if rows[j][2]==0 and rows[j-1][2]==1: pulse=dt[j]; break
-        j+=1
+# Where the Error Flag takes the line: the first move to the gap level after
+# the last data bit. Deliberately three quarters of a period after the last
+# rising edge, so the controller has sampled D0 first.
+flag=None
+j=bisect.bisect_right(dt,c[-1])
+while j<len(rows) and dt[j]<nxt_cycle:
+    if rows[j][2]==0 and rows[j-1][2]==1: flag=dt[j]; break
+    j+=1
 
 W=980;PAD=58;RIGHT=14
 tstart=c[0]-5e-6; tend=(tmu if tmu else c[-1])+9e-6
@@ -125,12 +134,12 @@ def mark(t,lab,cls,dy=0):
              f'class="ann {cls}t" text-anchor="{anc}">{lab}</text>')
 mark(c[0],"first falling edge","f1")
 mark(c[-1],"32nd clock","gd")
-if pulse: mark(pulse,"stale D0 held until the Error Flag lands","bad",26)
+if flag: mark(flag,"Error Flag takes the line","ef",26)
 if tmu: mark(tmu,f"DATA HIGH again — Tmu = {(tmu-c[-1])*1e6:.2f} us","gd",13)
 xg0,xg1=X(c[-1]),X(tmu if tmu else c[-1])
-s.append(f'<text x="{(xg0+xg1)/2:.1f}" y="{Y+80}" class="gaplab" text-anchor="middle">gap: Error Flag = NOT PV = 0</text>')
+s.append(f'<text x="{(xg0+xg1)/2:.1f}" y="{Y+80}" class="gaplab" text-anchor="middle">gap: Error Flag = NOT PV = {0 if pv else 1}</text>')
 
-svg=f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="222" viewBox="0 0 {W} 222">
+svg=f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="240" viewBox="0 0 {W} 240">
 <style>.ttl{{font:600 12.5px system-ui,sans-serif;fill:#0f172a}}
 .sub{{font:10.5px ui-monospace,monospace;fill:#64748b}}
 .lbl{{font:10.5px ui-monospace,monospace;fill:#475569}}
@@ -141,13 +150,13 @@ svg=f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="222" viewBox
 .gd{{stroke:#94a3b8;stroke-width:1;stroke-dasharray:3 3}} .gdt{{fill:#475569}}
 .rg{{stroke:#cbd5e1;stroke-width:0.7}}
 .f1{{stroke:#047857;stroke-width:1.5}} .f1t{{fill:#047857;font-weight:600}}
-.bad{{stroke:#dc2626;stroke-width:1.3;stroke-dasharray:2 2}}
-.badt{{fill:#dc2626;font-weight:600}}
+.ef{{stroke:#7c3aed;stroke-width:1.3;stroke-dasharray:2 2}}
+.eft{{fill:#7c3aed;font-weight:600}}
 .key{{font:10px system-ui,sans-serif;fill:#64748b}}</style>
 <rect width="100%" height="100%" fill="#ffffff"/>
 {chr(10).join(s)}
-<line x1="{PAD}" y1="206" x2="{PAD+22}" y2="206" class="rg"/>
-<text x="{PAD+28}" y="209" class="key">{KEY}</text>
+<line x1="{PAD}" y1="226" x2="{PAD+22}" y2="226" class="rg"/>
+<text x="{PAD+28}" y="229" class="key">{KEY}</text>
 </svg>'''
 open(out,"w").write(svg)
 print(f"wrote {out}  T={T*1e9:.1f}ns  raw={raw:08X} pv={pv} zpd={zpd} pd={pd} ts={ts}")
