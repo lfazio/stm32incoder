@@ -576,17 +576,28 @@ they are not retried:
 
 ### What the loopback can and cannot prove here
 
-The on-board test master samples on the **rising** edge, matching the shipping
-build's own bug. So it confirms framing, clock counts and `resyncs`, but it
-cannot confirm the edge. With either rising-edge build the master reads the
-payload shifted by one bit — `pd=447186` for `0x5A5A5` — self-consistently, so
-counts still read 198/198.
+The test master samples where the slave under test puts the data, and the two
+have to move together:
 
-For the same reason `ssi2` and `ssi6` report loopback failures under those
-builds while `ssi1`, `ssi4` and `ssi9` do not: those two are the only variants
-carrying an integrity check (parity, CRC-8), and a one-bit shift breaks a
-checksum where it merely relabels a plain position field. **Only `ssi4` has been
-confirmed on the analyser** under `SIMENC_TIMER_DATA`.
+| slave drives on | master samples on | builds |
+|---|---|---|
+| rising edge | falling edge | default, and `SIMENC_RISING_EDGE` |
+| falling edge | rising edge | SPI fallback (`TIMER_DATA=OFF`) |
+
+Getting this wrong reads every frame shifted by one bit, and it did: the master
+sampled one timer tick after the rising edge, which was right while the slave
+drove on the falling edge and became wrong when it moved to the rising one. The
+slave puts each bit up 56 ns after that edge, so a sample 5.6 ns after it
+captured the *previous* bit. `fixed 0x5A5A5` read back as 447186 —
+`(pd >> 1) | (ZPD << 18)` exactly. The master now samples late in the high
+phase, just before the next falling edge, which is where an SSI controller
+reads.
+
+That also explains why `ssi2` and `ssi6` used to fail in loopback while `ssi1`,
+`ssi4` and `ssi9` passed: those two are the only variants carrying an integrity
+check (parity, CRC-8), and a one-bit shift breaks a checksum where it merely
+relabels a plain position field. They should pass now. **Not yet re-verified on
+hardware** — the fix was made with the board disconnected.
 
 ### The Error Flag is late in the SPI builds, fixed in the timer build
 

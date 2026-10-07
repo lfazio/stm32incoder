@@ -24,13 +24,36 @@ void ssi_master_delay_us(uint32_t us)
     while ((DWT->CYCCNT - start) < cycles) { }
 }
 
+/* Which edge this test master samples on has to follow the edge the slave
+ * under test drives, or every frame reads back shifted by one bit.
+ *
+ *   slave drives on   master samples on   builds
+ *   rising edge       falling edge        default, and SIMENC_RISING_EDGE
+ *   falling edge      rising edge         SPI fallback (TIMER_DATA=OFF)
+ *
+ * A real SSI controller always samples on the falling edge; the rising-edge
+ * case exists only because the SPI fallback drives DATA half a period early,
+ * which is the deviation documented in the README. */
+#if defined(SIMENC_TIMER_DATA) || defined(SIMENC_RISING_EDGE)
+#define MASTER_SAMPLE_ON_FALLING 1
+#else
+#define MASTER_SAMPLE_ON_FALLING 0
+#endif
+
 static void spi_apply(void)
 {
     SSI_MASTER_SPI->CR1 &= ~SPI_CR1_SPE;
-    /* Master, CPOL=1/CPHA=1 to match the slave, 8-bit, MSB first.
+    /* Master, CPOL=1 so the clock idles HIGH as SSI requires, 8-bit, MSB
+     * first. CPOL=1 makes the leading edge of each bit period the falling one,
+     * so CPHA=0 samples on the fall and CPHA=1 on the rise -- see
+     * MASTER_SAMPLE_ON_FALLING.
+     *
      * SSM=1 with SSI=1 holds the internal NSS high, which a master needs to
      * avoid a mode fault. */
-    SSI_MASTER_SPI->CR1 = SPI_CR1_MSTR | SPI_CR1_CPOL | SPI_CR1_CPHA
+    SSI_MASTER_SPI->CR1 = SPI_CR1_MSTR | SPI_CR1_CPOL
+#if !MASTER_SAMPLE_ON_FALLING
+                        | SPI_CR1_CPHA
+#endif
                         | SPI_CR1_SSM | SPI_CR1_SSI
                         | ((uint32_t)s_br << SPI_CR1_BR_Pos);
     SSI_MASTER_SPI->CR2 = 0;
@@ -219,7 +242,24 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     X_TIM->ARR  = s_x_n - 1u;
     X_TIM->CCR1 = 1u;                /* falling edge, start of period */
     X_TIM->CCR3 = (s_x_n / 2u) + 1u; /* rising edge, half a period later */
-    X_TIM->CCR4 = (s_x_n / 2u) + 2u; /* sample just after the rising edge */
+#if MASTER_SAMPLE_ON_FALLING
+    /* Late in the high phase, just before the next falling edge, which is
+     * where an SSI controller reads: the bit was set on the rising edge and
+     * stays valid across the fall.
+     *
+     * Sampling one tick *after* the rising edge -- which this used to do --
+     * reads whatever was on the line before that edge, i.e. the previous bit.
+     * The slave puts each bit up 56 ns after the rising edge (DMA latency),
+     * which is 10 timer ticks at 500 kHz and 11 at 2 MHz, so a sample one tick
+     * later always lost the race. The symptom was the whole frame shifted one
+     * bit, making `fixed` and `ramp` read back (value >> 1) with ZPD shifted
+     * into the top: 0x5A5A5 came out as 447186. */
+    X_TIM->CCR4 = s_x_n - 2u;
+#else
+    /* The SPI fallback drives DATA on the falling edge, so the bit is already
+     * up by the rising edge and this samples in its stable window. */
+    X_TIM->CCR4 = (s_x_n / 2u) + 2u;
+#endif
     X_TIM->CCMR1 = 0;          /* channels as output compare, frozen: the
                                 * compare flags still fire, and no pin is
                                 * driven by the timer itself */
