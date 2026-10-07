@@ -373,12 +373,9 @@ clock idles HIGH the edges pair as (F1,R1), (F2,R2)… so the wrap always lands 
 a rising edge. A frozen channel-2 compare with `CCR2=0` matches at that wrap and
 raises one DMA request, which writes the next bit to `GPIOB->BSRR`.
 
-A second compare, channel 4 with `CCR4=1`, matches when the counter is at 1 —
-every falling edge — and drives a second DMA from a buffer of n+1 words: n zeros
-and then the Error Flag. Writing 0 to `BSRR` sets and resets nothing, so the
-first n are deliberate no-ops and only the (n+1)'th falling edge moves the line.
-That edge ends the Read Cycle, by which point the controller has sampled D0, so
-it is the only instant satisfying both §5.4.1 note 3 and the controller.
+The Error Flag is **not** placed this way. It is driven in software from the
+end-of-message interrupt — an attempt to do it in hardware is recorded below,
+along with why it could not work.
 
 What this buys, structurally rather than by tuning:
 
@@ -387,8 +384,6 @@ What this buys, structurally rather than by tuning:
   there, so the first bit period cannot be disturbed.
 - **No pin handover.** PB4 is a GPIO output for the whole cycle; only the
   *writer* changes. There is no 250 ns deadline and no interrupt in the bit path.
-- **The Error Flag is placed by hardware**, not by an interrupt, so the gap
-  cannot open with a spurious pulse.
 - **n need not be a multiple of 8**, which is what kept SSI7 and SSI8 out.
 
 ![One Read Cycle with DATA shifted by the clock](docs/img/ssi4-500khz-timer.svg)
@@ -400,9 +395,9 @@ Measured on the analyser at 500 kHz, 198 cycles:
 | Clocks per cycle | 32 on every cycle |
 | **DATA after its rising edge** | **+56 ns**, 3720/3720 |
 | **DATA moves between F1 and R1** | **0 / 198** |
-| **Gaps opening with a HIGH pulse** | **0 / 197** |
-| Payload sampled at the falling edge | **198 / 198 correct** |
-| Tmu | 20.43 µs |
+| Payload sampled at the falling edge | **197 / 197 correct** |
+| Tmu | 20.10–20.19 µs |
+| Gaps opening with a stale-D0 pulse | **98 / 197** — see the Error Flag below |
 
 The +56 ns is 2.8 % of a bit period at 500 kHz and 22 % at 2 MHz, so the bit is
 settled long before the controller samples it on the following falling edge.
@@ -427,27 +422,44 @@ it captured the *previous* bit, and `fixed 0x5A5A5` read back as 447186 —
 `(pd >> 1) | (ZPD << 18)` exactly.
 
 
-### The Error Flag, and why it is hardware-placed
+### KNOWN DEVIATION — the Error Flag is late
 
 §5.4.1 note 3 hands the data line to the Error Flag after the last rising edge.
-Driving it from software does not work well enough: an earlier build set it in
-the end-of-message interrupt and it arrived **0.83 µs late** at 500 kHz — 41 % of
-a bit period. Worse than "late", it was *wrong*: when the last data bit D0
-happened to be 1 the line was already HIGH when the message ended and stayed
-HIGH until the interrupt pulled it down, so the gap **opened with a HIGH pulse**
-while PV=1 says it must be LOW throughout. A controller reading the Error Flag
-early sees a spurious error. D0 is the Time Stamp LSB, so it hit about half of
-all cycles — 96 of 197 measured.
+The emulator gets the **level** right and the **timing** wrong: measured at
+500 kHz over 197 cycles, the flag lands **416 ns after the last rising edge**
+(400–528). Until that store reaches the pin the line still carries D0, so on the
+cycles where D0 happens to be 1 — about half of them, 98 of 197 — the gap
+**opens with a spurious HIGH pulse** while PV=1 says it must be LOW throughout.
+A controller sampling the Error Flag immediately would read an error that is not
+there.
 
-| | gaps opening HIGH | pulse width |
+The level itself is correct in every cycle, and that is worth stating because an
+earlier attempt got it wrong in a way that looked right:
+
+| Error Flag driven by | gap tracks PV? | measured |
 |---|---|---|
-| software, from the end-of-message ISR | 96 / 197 | 1800 ns |
-| **hardware, CC4 DMA at the last falling edge** | **0 / 197** | — |
+| CC4 DMA at a falling edge | **no** | PV=0 read LOW in **182 / 197** cycles |
+| end-of-message interrupt | yes | 197/197 at PV=1 *and* PV=0, 416 ns late |
 
-Measuring only the settled gap level hides this completely — that is what "gap
-level LOW ×200" reports — and it is why it went unnoticed. It was caught by eye
-on a capture, not by the analysis scripts, which now check for it.
+**Why the hardware version could not work.** The idea was a second DMA on a
+channel-4 compare, one word per falling edge from a buffer of n no-ops followed
+by the flag — `BSRR` ignores a zero word, so only the last entry would move the
+line. But that entry sits at index n and therefore needs an **(n+1)'th falling
+edge**, and a Read Cycle of n clock periods has exactly **n**. The captures
+confirm 32 falling edges per cycle. No controller can supply the extra edge, so
+this is wrong in principle rather than unlucky, and it was removed.
 
+It also failed *silently*: the gap simply held the stale last data bit, which
+for a `fixed` payload is nearly constant, so a check that only looked for extra
+rising transitions reported a clean 0/197. The test that actually catches it is
+comparing the gap level between PV=1 and PV=0 — if the flag is not driven, the
+level does not change.
+
+**Placing it in hardware needs a timer, not a clock edge**, since the last data
+bit is written on the last edge the cycle has. A timer in reset-slave mode off
+the clock would fire once the clock stops and could drive the write by DMA, but
+it needs the clock on a second pin — the arrangement that was just removed
+because one pin per clock is simpler and avoids the skew trap. Unresolved.
 
 ## Measured against the specification
 
@@ -491,17 +503,23 @@ measures like any other rate.
 
 | | 500 kHz | 2 MHz |
 |---|---|---|
+| Clock rate | 0.5000 MHz | 2.0006 MHz |
 | Clocks per cycle | 32 on every one | 32 on every one |
 | Payload | 197/197 | 197/197 |
-| DATA after its rising edge | +56 ns, 3720/3720 | +56 ns, 3740/3740 |
+| DATA after its rising edge | +56 ns, 3724/3724 | +56 ns, 3734/3734 |
 | — as a fraction of the half period | 2.8 % | 22 % |
 | DATA moves between F1 and R1 | 0 | 0 |
-| Gaps opening with a HIGH pulse | 0 | 0 |
-| Tmu (spec 20 µs ± 1) | 20.43 µs | 19.66 µs |
+| Tmu (spec 20 µs ± 1) | 20.10–20.19 µs | 20.14–20.24 µs |
+| Gaps opening with a stale-D0 pulse | 98 / 197 | 95 / 197 |
 
-Both land inside the Tmu window from the same dynamic correction, which is the
-point of measuring `T` per frame rather than assuming it: the half-period term
-it removes is 1 µs at 500 kHz and 0.25 µs at 2 MHz.
+Both Tmu figures land inside the window from the same dynamic correction, which
+is the point of measuring `T` per frame rather than assuming it: the half-period
+term it removes is 1 µs at 500 kHz and 0.25 µs at 2 MHz. Lose that measurement
+and the two ends diverge by exactly that much — which is what happened when the
+SPI removal orphaned it on a deleted DMA stream.
+
+The stale-D0 pulse is the Error Flag deviation above, not a rate-dependent
+effect: it appears on whichever cycles have D0 = 1.
 
 
 ## Architecture

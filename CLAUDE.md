@@ -235,29 +235,38 @@ Watch integer truncation in that arithmetic: `1000/(SYSCLK_HZ/1000000)` is 5,
 not 5.56, which reported every period 10% short until it was caught against the
 analyser. Scale before dividing.
 
-**Re-verified on hardware after the SPI removal** (a different board; ST-LINK
-serial 066DFF555670655067161435, only one adapter attached so no `adapter
-serial` pin is needed):
+**Re-verified on hardware with a logic analyser after the SPI removal** (a
+different board; ST-LINK serial 066DFF555670655067161435, one adapter attached
+so no `adapter serial` pin is needed). 197 cycles at each rate:
 
-  wire                  CLOCK PB10->PC6 OK, DATA PB4->PB14 OK
-  fixed 0x5A5A5         reads back 370085 at 100k/250k/500k/1M/1.5M/2M
-  burst 200 50          ok=198 bad=0 at every one of those rates
-  all five variants     98/98 at 500 kHz, ssi2 and ssi6 included
-  err on                98/98 with PV=0
-  measured_T            1996 ns at 500 kHz -- the dynamic Tmu correction is
-                        live again (it read 0 ns while the measurement was
-                        orphaned on the deleted SPI receive DMA)
+                              500 kHz          2 MHz
+  clocks per cycle            32 on every one  32 on every one
+  DATA after its rising edge  +56 ns, 3724/3724  +56 ns, 3734/3734
+  DATA moves F1..R1           0                0
+  payload                     197/197          197/197
+  Tmu                         20.10..20.19 us  20.14..20.24 us
 
-ssi2 and ssi6 passing is the useful signal: they are the only variants with an
-integrity check, and they failed before precisely because a one-bit shift
-breaks parity and CRC where it merely relabels a plain position field.
+Loopback: `fixed 0x5A5A5` reads back 370085 at 100k/250k/500k/1M/1.5M/2M,
+198/198 each, all five variants 98/98 at 500 kHz including ssi2 and ssi6 --
+which is the useful signal, since they are the only variants with an integrity
+check and a one-bit shift breaks parity and CRC where it merely relabels a
+position field.
 
-**Still not measured on an analyser since the SPI removal** -- the `logic2` MCP
-was down. The edge placement and the Error Flag's hardware slot are unverified
-against a capture; the loopback only proves framing and payload.
+**KNOWN DEVIATION, measured: the Error Flag is 416 ns late** (400..528 over 197
+cycles). The level is right in every cycle at both PV=1 and PV=0, but until the
+store lands the line still carries D0, so on the ~half of cycles where D0=1 the
+gap opens with a spurious HIGH pulse (98/197 at 500 kHz, 95/197 at 2 MHz).
 
-**Still open**: the Error Flag buffer has n+1 entries (n no-ops then the flag)
-but the test master emits exactly n falling edges per Read Cycle. If that
-reading is right the flag entry is never reached and the gap holds D0 instead.
-An earlier "0/197 gaps opening HIGH" could have been a false pass if D0 was 0
-throughout. Needs an analyser with `err on` and a `fixed` value whose LSB is 1.
+Do not try to place the flag with a DMA on a falling-edge compare. It was tried:
+a buffer of n no-ops then the flag, relying on BSRR ignoring a zero word. The
+flag sits at index n and so needs an (n+1)'th falling edge, and a Read Cycle of
+n clock periods has exactly n -- confirmed on the capture, 32 falling edges per
+cycle. It failed silently, the gap holding the stale last data bit, which for a
+`fixed` payload is nearly constant, so a glitch check that only looked for extra
+rising transitions reported a clean 0/197. **The test that catches it is
+comparing the gap level between PV=1 and PV=0**: if the flag is not driven the
+level does not change. It read LOW in 182/197 cycles with PV=0, where it must
+read HIGH.
+
+Placing it in hardware needs a timer, not a clock edge, since the last data bit
+is written on the last edge the cycle has. Unresolved.
