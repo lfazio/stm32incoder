@@ -50,7 +50,7 @@ banner reports which oscillator locked. Force one with
 The SSI clock must reach **PC6** (`TIM8_CH1`, morpho **CN10-4**). That is the
 only clock input: it clocks TIM8, which is what shifts DATA out. Without it no
 message ever completes and the link is simply dead — `stat` reports
-`etr=NEVER REACHED n` rather than leaving that a puzzle.
+`clock in PC6: NEVER REACHED n` rather than leaving that a puzzle.
 
 How the bits get onto the wire is described in
 [How each bit reaches the wire](#how-each-bit-reaches-the-wire).
@@ -157,24 +157,27 @@ ssi6  DFC12345    CRC-8 0xDF over the 24-bit body
 ssi9  C91A2B92    as ssi4, TS counting in 1 µs steps
 ```
 
-SSI7 (n=30) and SSI8 (n=18) are **not** implemented: they are not byte aligned,
-and `ssi_slave` transfers whole bytes.
+SSI7 (n=30) and SSI8 (n=18) are **not** implemented. Nothing in the data path
+requires byte alignment any more — end of message is a DMA transfer count of n,
+whatever n is — so what remains is the guard in `ssi_slave_set_frame_bits()` and
+the codecs themselves.
 
-Checked on the analyser at 500 kHz, 100 Read Cycles each, with the payload
-decoded independently in `tools/logic/variants.py` — parity and CRC recomputed
-there rather than trusted from the firmware:
+All five re-checked on the current build at 500 kHz, `burst 100 50`, each
+`ok=98 bad=0` with the raw frames above reproduced exactly.
 
-| Variant | clocks/cycle | Tmu | frames | integrity |
-|---|---|---|---|---|
-| SSI1 | 24 × 100 | 20.13 µs | pass | — |
-| SSI2 | 24 × 100 | 20.34 µs | pass | parity ✓ |
-| SSI4 | 32 × 100 | 20.03 µs | pass | — |
-| SSI6 | 32 × 100 | 20.04 µs | pass | CRC-8 ✓ |
-| SSI9 | 32 × 100 | 20.02 µs | pass | — |
+**SSI2 and SSI6 passing in loopback is now meaningful**, where it used not to
+be. They are the only variants carrying an integrity check — parity and CRC-8 —
+and the test master decodes them with its own implementation. While the master
+sampled a bit early every frame came back shifted, which breaks a checksum but
+merely relabels a plain position field, so those two failed and the other three
+passed. That asymmetry is what identified the sampling bug, and their passing
+now is the evidence it is gone.
 
-The independent CRC-8 of the SSI6 body `0xC12345` is `0xDF`, which is what the
-firmware emitted — so that field is now confirmed against a second
-implementation of the guide's parameters, not just round-tripped.
+An earlier analyser run decoded all five in `tools/logic/variants.py` with
+parity and CRC recomputed outside the firmware, confirming the SSI6 CRC-8 of
+body `0xC12345` as `0xDF`. That run predates the timer data path; the frames it
+checked are byte-identical to the ones above, but the timing figures from it
+have been superseded.
 
 **The SSI6 CRC is computed in software, and has to be.** The STM32F446 has a CRC
 peripheral, but RM0390 4.1 describes "a *fixed* generator polynomial" and 4.2
@@ -183,7 +186,7 @@ names it: "CRC-32 (Ethernet) polynomial: 0x4C11DB7". There is no `CRC_POL` or
 with F0/F3/L4/H7. SSI6 needs CRC-8 with polynomial 0x97, so the hardware unit
 cannot produce it. The software version is 24 shift/xor steps inside
 `stage_frame()`, which runs in the Tmu handler *after* DATA has already been
-driven high, so it is off both the 250 ns handover path and the Tmu measurement.
+driven high, so it is off the data path entirely.
 
 ## Loopback testing
 
@@ -206,17 +209,31 @@ Check the wiring before anything else — the firmware can test it itself:
 wire
 ```
 
-It drives PB10 and PB4 as GPIO and verifies that PB3 and PB14 follow both
-levels, printing `OK` or `OPEN` per wire. It does **not** check the PC6 tap —
-`stat` does, reporting `etr=counted n` once a full message has been clocked, or
-`etr=NEVER REACHED n` if that wire is missing. Do not test that tap by asking
-whether the counter has seen an edge: a floating pin picks up enough noise to
-answer yes while the link stays dead. `OPEN` means that pin pair is not
-connected, whatever the wire looks like.
+It drives PB10 and PB4 as GPIO and checks that **PC6** and PB14 follow both
+levels, printing `OK` or `OPEN` per wire:
 
-`wire` is safe to run at any time: every arm reloads the DMA transfer counts
-from scratch, so the clock edges the test injects cannot leave the framing
-skewed.
+```
+CLOCK PB10(CN10-25,D6) -> PC6(CN10-4)     : OK
+DATA  PB4 (CN10-27,D5) -> PB14(CN10-28)   : OK
+loopback ready
+```
+
+It parks the transport first (`ssi_slave_stop()`) and re-arms afterwards. That
+is not optional: the test toggles the clock pin, PC6 sees those edges, and
+TIM8's DMA would otherwise write PB4 from under the test and report the DATA
+wire OPEN when it is fine. The SPI path had the same hazard through EXTI3.
+
+`stat` answers the other half — whether the clock is actually driving the
+counter:
+
+```
+clock in PC6: counted n
+```
+
+That says a full message has been clocked. Do **not** test the tap by asking
+whether the counter has seen an *edge*: a floating pin picks up enough noise to
+answer yes while the link stays dead. Reaching *n* is the property worth
+reporting.
 
 Then:
 
@@ -243,11 +260,11 @@ Verified against the slave's own independent period measurement:
 
 | Requested | Programmed | Slave measured T |
 |---|---|---|
-| 2 MHz | 2 000 000 Hz | 495 ns |
-| 1 MHz | 1 000 000 Hz | 995 ns |
-| 500 kHz | 500 000 Hz | 1997 ns |
-| 250 kHz | 250 000 Hz | 3999 ns |
-| 100 kHz | 100 000 Hz | 10000 ns |
+| 2 MHz | 2 000 000 Hz | 502 ns |
+| 1 MHz | 1 000 000 Hz | 1002 ns |
+| 500 kHz | 500 000 Hz | 2003 ns |
+| 250 kHz | 250 000 Hz | 4005 ns |
+| 100 kHz | 100 000 Hz | 10006 ns |
 
 Every rate programmed exactly (+0.0 %), and `burst 40` decoded `ok=38 bad=0` at
 each — `burst` skips two warm-up cycles, so it reports `n-2`. The power-on
@@ -306,11 +323,11 @@ DATA  (encoder -> controller)
   PB4  ──▶ U1.DI     U1.Y/Z ══twisted pair══▶ U2.A/B     U2.RO ──▶ PB14
 
 CLOCK (controller -> encoder)
-  PB10 ──▶ U2.DI     U2.Y/Z ══twisted pair══▶ U1.A/B     U1.RO ──▶ PB3
+  PB10 ──▶ U2.DI     U2.Y/Z ══twisted pair══▶ U1.A/B     U1.RO ──▶ PC6
 ```
 
 - **Supply:** MAX490 is a 5 V part — feed it from CN6-5 (+5V). Its RO outputs
-  swing to ~5 V, which is safe because PB3 and PB14 are both `FT`. In the other
+  swing to ~5 V, which is safe because PC6 and PB14 are both `FT`. In the other
   direction the STM32's 3.3 V output clears the MAX490's ~2 V input threshold.
 - **Ground:** tie the two modules' grounds together and to the Nucleo GND.
 - **Termination:** the Product Guide states that DATA outputs and CLOCK inputs
@@ -327,22 +344,18 @@ modules, `fixed 0x5A5A5`, `burst 200 50` at each rate:
 | 500 kHz | 198/198 | correct |
 | 1.0 MHz | 198/198 | correct |
 | 1.5 MHz | 194–197 / 200 | correct |
-| 2.0 MHz | 196–198 / 200 | shifted one bit — see below |
+| 2.0 MHz | 196–198 / 200 | shifted one bit |
 
-`resyncs=0` throughout, and all five variants are clean at 500 kHz (98/98 each
-for SSI1, SSI2, SSI4, SSI6, SSI9). The two top rates scatter by half to two per
-cent run to run, but they scatter by the same amount over the plain TTL jumpers
-measured the same afternoon, so that is the link's own margin at those rates
-rather than anything the transceivers introduce. (Those figures predate the
-timer data path.)
+`resyncs=0` throughout, and all five variants were clean at 500 kHz.
 
-The one-bit shift at 2 MHz — the test master decodes PD as 447186 =
-`(0x5A5A5 >> 1) | 0x40000` instead of 370085, consistently, which is why the
-count still reads 198/198 — is the on-board master sampling, not the wire. The
-logic analyser decodes the same frames correctly at 2 MHz. It is the KNOWN
-DEVIATION above seen from the receiving end: master and slave are both a half
-period out, in the same direction, which cancels below ~1 MHz and stops
-cancelling as the period approaches the sampling delay.
+**Those figures are from the SPI data path and are kept only as the RS-422
+record.** Two of their findings have since been explained and fixed: the
+one-bit shift at 2 MHz was the test master sampling one tick after the rising
+edge, and the scatter at the top two rates went with it. On the current build
+the same sweep over the bench wiring reads **198/198 at 100 kHz, 250 kHz,
+500 kHz, 1 MHz, 1.5 MHz and 2 MHz** with the payload correct at every rate.
+Whether the transceivers were still in line for that run is not recorded, so
+treat the RS-422 column as needing one more pass.
 
 ## Conformance: clock edges and the Error Flag
 
@@ -401,8 +414,8 @@ Measured on the analyser at 500 kHz, 197 cycles:
 | | result |
 |---|---|
 | Clocks per cycle | 32 on every cycle |
-| **DATA after its rising edge** | **+56 ns**, 3720/3720 |
-| **DATA moves between F1 and R1** | **0 / 198** |
+| **DATA after its rising edge** | **+56 ns**, 3740/3740 |
+| **DATA moves between F1 and R1** | **0 / 197** |
 | Payload sampled at the falling edge | **197 / 197 correct** |
 | Tmu | 20.01–20.17 µs |
 | Last data bit D0 survives to be sampled | yes — see the Error Flag below |
@@ -481,49 +494,29 @@ gap level between PV=1 and PV=0, not looking for extra transitions.
 ## Measured against the specification
 
 Captured with a Saleae Logic Pro 16 at 125 MS/s (8 ns resolution), 3.3 V
-threshold, falling-edge trigger on the clock: `clk 2000000` then `burst 200 50` with `fixed 0x5A5A5`, run once with PV=1 and once with `err on`.
+threshold, triggering on the clock, with `fixed 0x5A5A5` and `burst`, run once
+with PV=1 and once with `err on`. HSE locked.
 
-**These numbers were measured with HSE locked and the dynamic Tmu correction in
-place.** Re-capture with
-`tools/logic/` after touching the SSI path — an earlier revision of this table
-was silently stale for exactly that reason. (This used to cite a commit hash;
-history has since been rewritten twice, which made the hash dangle. The build
-configuration is the durable reference.)
+Re-capture with `tools/logic/` after touching the SSI path. An earlier revision
+of this section was silently stale for exactly that reason, and a later one
+reported a defect as fixed on a measurement that could not have detected it —
+see the Error Flag section for how that happened and what test actually catches
+it.
 
-### The ordinary case, at 500 kHz
+### 500 kHz against 2 MHz
 
-At 500 kHz one bit is 2 µs, so a whole Read Cycle fits on the page at a scale
-where the frame layout is legible.
-
-![One SSI4 Read Cycle captured at 500 kHz](docs/img/ssi4-500khz-capture.svg)
-
-One cycle, all 32 clocks, with the SSI4 fields banded over the bit cells: PV,
-ZPD, PD[18:0], TS[10:0]. The payload decoded straight off the capture is
-`PD=370085` — the 0x5A5A5 that was set — with PV=1 and ZPD=1, and the whole run
-is **200/200 correct**, 32 clocks on every cycle, `Tmu = 20.16 µs` mean
-(20.10–20.21), gap LOW throughout. The Error Flag follows the last rising edge
-by 0.83 µs.
-
-The faint vertical rules mark every **clock rising edge** — the edges the
-specification says each data bit should be set on. DATA transitions land
-between them, on the falling edges — this capture predates the timer data path
-and is kept only to show what the deviation looked like. The green rule is the
-first falling edge, which starts the Read Cycle.
-
-### The same thing at 2 MHz
-
-2 MHz is the top of the specified range, and on the default data path it is not
-a special case — there is no handover, no deadline and nothing to tighten, so it
+2 MHz is the top of the specified range, and on this data path it is not a
+special case — there is no handover, no deadline and nothing to tighten, so it
 measures like any other rate.
 
 ![SSI4 Read Cycle captured at 2 MHz](docs/img/ssi4-2mhz-capture.svg)
 
 | | 500 kHz | 2 MHz |
 |---|---|---|
-| Clock rate | 0.5000 MHz | 2.0006 MHz |
+| Clock rate | 0.5000 MHz | 2.0005 MHz |
 | Clocks per cycle | 32 on every one | 32 on every one |
 | Payload | 197/197 | 197/197 |
-| DATA after its rising edge | +56 ns, 3724/3724 | +56 ns, 3734/3734 |
+| DATA after its rising edge | +56 ns, 3740/3740 | +56 ns, 3739/3739 |
 | — as a fraction of the half period | 2.8 % | 22 % |
 | DATA moves between F1 and R1 | 0 | 0 |
 | Tmu (spec 20 µs ± 1) | 20.01–20.17 µs | 19.97–20.12 µs |
@@ -532,14 +525,12 @@ Also measured at 100 kHz, the other end of the window: 32 clocks, +56 ns,
 197/197, Tmu 20.02–20.19 µs. All three rates sit inside 20 ± 1 µs from the same
 dynamic correction, across a 20× span of clock period.
 
-Both Tmu figures land inside the window from the same dynamic correction, which
-is the point of measuring `T` per frame rather than assuming it: the half-period
-term it removes is 1 µs at 500 kHz and 0.25 µs at 2 MHz. Lose that measurement
-and the two ends diverge by exactly that much — which is what happened when the
-SPI removal orphaned it on a deleted DMA stream.
-
-The stale-D0 pulse is the Error Flag deviation above, not a rate-dependent
-effect: it appears on whichever cycles have D0 = 1.
+All three land inside the window from the same dynamic correction, which is the
+point of measuring `T` per frame rather than assuming it: the half-period term
+it removes is 5 µs at 100 kHz and 0.25 µs at 2 MHz. Lose that measurement and
+the ends diverge by exactly that much — which is what happened when the SPI
+removal orphaned it on a deleted DMA stream, and Tmu silently spread from 19.66
+to 20.43 µs across the range.
 
 
 ## Architecture
@@ -566,19 +557,19 @@ not swapping a back end.
 
 1. Between messages PB4 is a GPIO output holding the SSI idle-HIGH level. It
    stays a GPIO output for the whole cycle; only the *writer* changes.
-2. On arming, the next frame is expanded into two `BSRR` buffers — one word per
-   bit, and one word per falling edge holding n no-ops then the Error Flag —
-   and both DMA streams are loaded. TIM8's counter is zeroed and started.
-3. The master's **first falling edge** is counted but writes only a no-op, so
+2. On arming, the next frame is expanded into one `BSRR` word per bit, the DMA
+   is loaded with them, and TIM8's counter is zeroed and started.
+3. The master's **first falling edge** is counted but raises no compare, so
    nothing happens on the line. There is no handover and no deadline.
 4. Each **rising** edge wraps the counter, matching the CH2 compare, and the DMA
    writes the next bit. The half-transfer event times the clock period on the
    way past.
 5. After n bits the DMA's transfer-complete marks end of message and starts TIM6
-   as a one-shot for Tmu less the measured half period and the ISR overhead.
-   The Error Flag is *not* set here — the CH4 DMA already placed it on the last
-   falling edge.
-6. TIM6's update returns DATA to HIGH, stages the next frame and re-arms.
+   for three quarters of a clock period — long enough for the controller to
+   sample the last bit.
+6. TIM6's first update hands the line to the Error Flag and restarts TIM6 for
+   the rest of Tmu.
+7. TIM6's second update returns DATA to HIGH, stages the next frame and re-arms.
 
 Position and timestamp are latched **together** by the 100 µs update tick, so
 `TS` reports when the position was measured rather than when it was sent.
@@ -587,16 +578,16 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
 
 | Peripheral | Role | DMA (RM0390 Tables 28/29) |
 |---|---|---|
-| **TIM8** | **clocked by the SSI clock on PC6 (TI1F_ED, both edges, ARR=1); CH2 compare shifts each data bit, CH4 compare places the Error Flag** | **CH2→DMA2 S3 C7, CH4→DMA2 S7 C7, both → `GPIOB->BSRR`** |
-| TIM6 | Tmu one-shot gap, 0.1 µs tick | — |
+| **TIM8** | **clocked by the SSI clock on PC6 (TI1F_ED, both edges, ARR=1); the CH2 compare shifts each data bit** | **CH2→DMA2 S3 C7 → `GPIOB->BSRR`** |
+| TIM6 | two-stage gap, 0.1 µs tick: Error Flag, then the rest of Tmu | — |
 | TIM7 | Time Stamp counter, 10 µs tick, wraps 2048 | — |
 | TIM2 | 10 kHz update tick + ADC trigger (TRGO) | — |
 | ADC1 IN0 | angle acquisition | DMA2 S0 C0, circular |
 | USART2 | trace/console | TX DMA1 S6 C4 |
 | **TIM1** | **test-master clock, any 180 MHz / N** | **CH1→DMA2 S1 C6 (clock low), CH3→S6 C6 (clock high), CH4→S4 C6 (sample IDR)** |
 
-Both DATA streams must be on DMA2: GPIO is on AHB1 and DMA1 cannot reach it.
-That is also why the timer is TIM8 — it is the free APB2 timer, and APB2 timer
+The DATA stream must be on DMA2: GPIO is on AHB1 and DMA1 cannot reach it. That
+is also why the timer is TIM8 — it is the free APB2 timer, and APB2 timer
 requests land on DMA2. No SPI is involved anywhere, at either end of the link.
 
 ## Design decisions that are *not* from the specification
@@ -635,22 +626,29 @@ requests land on DMA2. No SPI is involved anywhere, at either end of the link.
 - **Update rate 10 kHz.** The guide specifies "< 0.1 ms"; 100 µs is the fastest
   value satisfying it.
 - **Error-flag hold time.** The guide holds the Error Flag for `Tmu − 0.5·T`.
-  The emulator does measure `T` — from the receive DMA's half-transfer to
+  The emulator measures `T` — from the DATA DMA's half-transfer to
   transfer-complete interval — and sets the gap to `Tmu − 0.5·T` less a fixed
   interrupt overhead, so Tmu lands inside spec across the whole clock range
-  (verified 20.07 µs at 2 MHz and 20.14 µs at 100 kHz). The residual deviation
-  is at the *start* of the gap, not its length: the Error Flag appears ~0.7 µs
-  late because the end-of-frame interrupt has to run first.
+  (measured 20.09 µs at 500 kHz, 20.02 at 2 MHz, 20.10 at 100 kHz). The
+  deviation is at the *start* of the gap, not its length — see
+  [The Error Flag, and the last data bit](#the-error-flag-and-the-last-data-bit).
 
 ## Known limitations
 
 - **The SSI clock must reach PC6** (CN10-4). It is the only clock input, and
-  without it nothing works at all — `stat` says `etr=NEVER REACHED n`.
+  without it nothing works at all — `stat` says `clock in PC6: NEVER REACHED n`.
 - `ssi_slave_set_frame_bits()` still rejects frame lengths that are not a
   multiple of 8, so SSI7 (n=30) and SSI8 (n=18) remain unimplemented. Nothing in
   the data path requires that any more — end of message comes from a DMA
   transfer count of n, whatever n is — so the restriction is now only the guard
   and the variant table.
+- **The Error Flag takes the line late** — about 1.8 µs of fixed two-interrupt
+  latency plus 0.75·T after the last rising edge, where §5.4.1 note 3 puts it
+  at that edge. The level is right in every cycle and it holds for the rest of
+  Tmu, but a controller sampling the flag immediately would still see the last
+  data bit. Placing it earlier means placing it by DMA, which this part cannot
+  do here — see
+  [The Error Flag, and the last data bit](#the-error-flag-and-the-last-data-bit).
 - The SSI6 CRC is checked against our own implementation of the guide's
   parameters, which proves round-trip consistency rather than conformance to an
   external reference vector.
