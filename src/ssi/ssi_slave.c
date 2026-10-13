@@ -5,6 +5,7 @@
 #define SSI_DATA_CLEAR_FLAGS (DMA_LIFCR_CTCIF3 | DMA_LIFCR_CHTIF3 | \
                               DMA_LIFCR_CTEIF3 | DMA_LIFCR_CDMEIF3 | \
                               DMA_LIFCR_CFEIF3)
+#define SSI_DATA_IRQ_ENABLES (DMA_SxCR_TCIE | DMA_SxCR_HTIE)
 
 #define CLK_TIM         SSI_CLKIN_TIM      /* TIM8: APB2, so DMA2 reaches GPIO */
 
@@ -45,6 +46,8 @@ static uint8_t               s_nbytes;
 static volatile uint32_t     s_bsrr[32];
 static volatile bool         s_armed;
 static volatile uint16_t     s_last_ndtr;
+static volatile uint32_t     s_last_frames;
+static volatile uint32_t     s_last_move;      /* DWT cycles when NDTR last moved */
 static volatile uint32_t     s_frames;
 static volatile uint32_t     s_resyncs;
 static volatile bool         s_gap_level;
@@ -119,6 +122,26 @@ static void stage_frame(void)
 
 static inline void clock_counter_arm(void);
 
+/* Stop the DATA DMA without it reporting an end of message.
+ *
+ * Clearing EN on a live memory-to-peripheral stream sets TCIF [RM0390 Rev 9
+ * 9.3.14 and 9.3.15, p.216]. With TCIE on, every re-arm therefore raised a
+ * transfer-complete interrupt that the handler took for the end of a real
+ * message: it started the Error Flag and Tmu sequence mid-frame, and measured
+ * T from a half-transfer timestamp left over from an earlier message. Captured
+ * against a 562.5 kHz master, that put a 3.7 us LOW pulse ~14 us after the
+ * last rising edge where the Error Flag should hold the line for ~17 us.
+ *
+ * TCIE and HTIE are not protected bits [RM0390 Rev 9 DMA_SxCR, p.226], so they
+ * go off in the same write as EN, and anything already pended goes with them. */
+static void data_dma_halt(void)
+{
+    SSI_DATA_DMA_STREAM->CR &= ~(DMA_SxCR_EN | SSI_DATA_IRQ_ENABLES);
+    while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
+    NVIC_ClearPendingIRQ(SSI_DATA_DMA_IRQn);
+}
+
 /* Arm one message: the DATA DMA reloads, then the edge counter starts.
  *
  * There is no pin handover and no shift register here. PB4 stays a GPIO output
@@ -142,13 +165,12 @@ static void ssi_arm(void)
     CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
     CLK_TIM->SR    = 0;
 
-    SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-    while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
-    DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
+    data_dma_halt();
+    s_ht_bits = 0;      /* no half-transfer seen in this message yet */
 
     SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
     SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
-    SSI_DATA_DMA_STREAM->CR  |= DMA_SxCR_EN;
+    SSI_DATA_DMA_STREAM->CR  |= SSI_DATA_IRQ_ENABLES | DMA_SxCR_EN;
 
 
     /* The gap level is already on the pin; leave it there until the first
@@ -315,16 +337,19 @@ void DMA2_Stream3_IRQHandler(void)
         SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
         DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
         /* The interval spans however many rising edges remained after the
-         * half-transfer event, which s_ht_bits records exactly. */
-        uint32_t span = (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits)
-                      ? (uint32_t)(s_cfg.n_bits - s_ht_bits)
-                      : (uint32_t)(s_cfg.n_bits / 2u);
-        /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- the
-         * other order truncates to 5 and reports every period 10% short. */
-        uint32_t per_ns = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
-        if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
-            s_period_ns    = per_ns;
-            s_period_valid = true;
+         * half-transfer event, which s_ht_bits records exactly. ssi_arm()
+         * zeroes it, so a message whose half-transfer was never seen -- or was
+         * served together with TC -- keeps the last good T rather than
+         * dividing a stale timestamp. */
+        if (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits) {
+            uint32_t span = (uint32_t)(s_cfg.n_bits - s_ht_bits);
+            /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- the
+             * other order truncates to 5 and reports every period 10% short. */
+            uint32_t per_ns = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
+            if (per_ns >= 400u && per_ns <= 12000u) {   /* 2 MHz .. ~83 kHz */
+                s_period_ns    = per_ns;
+                s_period_valid = true;
+            }
         }
 
         s_armed = false;
@@ -438,8 +463,11 @@ void ssi_slave_stop(void)
     CLK_TIM->DIER  = 0;
     CLK_TIM->SR    = 0;
 
-    SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
-    while (SSI_DATA_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    /* Halted rather than just disabled: a bare EN clear raises TC (see
+     * data_dma_halt), which the handler would count as a message -- setting
+     * s_clk_counted, so `stat` would call the clock wire good after `wire`
+     * whether or not it had ever carried one. */
+    data_dma_halt();
 
     GAP_TIM->CR1 &= ~TIM_CR1_CEN;
     GAP_TIM->SR   = 0;
@@ -479,20 +507,45 @@ void ssi_slave_poll(void)
         return;
     }
 
-    /* A healthy link either sits at NDTR == n (no cycle in progress) or races
-     * through a message in at most n x 10 us. Anything else means the master
-     * stopped clocking mid-message, which would leave the byte framing skewed
-     * for every later cycle -- so drop it and re-arm. */
-    uint16_t ndtr = (uint16_t)SSI_DATA_DMA_STREAM->NDTR;
-    const uint16_t idle_ndtr = s_cfg.n_bits;
+    /* A healthy link either sits at NDTR == n (no cycle in progress) or moves
+     * NDTR once per clock period, and 1/T is 100 kHz .. 2 MHz (IncOder 5.4.1),
+     * so at most every 10 us. A message that has stood still for Tmu = 20 us
+     * has been abandoned: that is two periods at the slowest legal rate, and
+     * 5.4.1 makes any gap longer than Tmu an intermessage gap (Timg > Tmu).
+     * Drop it and re-arm, or the framing stays skewed for every later cycle.
+     *
+     * The threshold has to be a time. This used to fire whenever two passes of
+     * the main loop read the same NDTR -- and the loop runs in a few hundred
+     * ns, far inside one bit period, so with an external master it re-armed
+     * after nearly every bit and the frame restarted from D(n-1) every three
+     * to five bits (562.5 kHz capture: 40% of DATA writes on falling edges,
+     * TS never advancing). The loopback never showed it because `read` and
+     * `burst` block the main loop while the test master clocks.
+     *
+     * Time is read before NDTR: if an interrupt lands between the two, NDTR is
+     * the fresher reading and a stall can only be under-estimated. s_frames
+     * catches a whole message slipping by while the loop was held up, which
+     * could leave NDTR back at the value it had before. */
+    uint32_t now    = DWT->CYCCNT;
+    uint16_t ndtr   = (uint16_t)SSI_DATA_DMA_STREAM->NDTR;
+    uint32_t frames = s_frames;
 
-    if (ndtr != idle_ndtr && ndtr == s_last_ndtr) {
-        s_resyncs++;
-        data_drive(true);
-        stage_frame();
-        ssi_arm();
+    if (ndtr == s_cfg.n_bits || ndtr != s_last_ndtr || frames != s_last_frames) {
+        s_last_ndtr   = ndtr;
+        s_last_frames = frames;
+        s_last_move   = now;
+        return;
     }
-    s_last_ndtr = ndtr;
+
+    if ((now - s_last_move) < (uint32_t)s_cfg.tmu_us * (SYSCLK_HZ / 1000000u)) {
+        return;
+    }
+
+    s_resyncs++;
+    data_drive(true);
+    stage_frame();
+    ssi_arm();
+    s_last_ndtr = s_cfg.n_bits;
 }
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out)
