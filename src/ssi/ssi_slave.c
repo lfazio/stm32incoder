@@ -7,78 +7,74 @@
                               DMA_LIFCR_CFEIF3)
 #define SSI_DATA_IRQ_ENABLES (DMA_SxCR_TCIE | DMA_SxCR_HTIE)
 
+/* DMA2 stream 7: flags live in the HIGH interrupt registers. */
+#define SSI_TMU_CLEAR_FLAGS  (DMA_HIFCR_CTCIF7 | DMA_HIFCR_CHTIF7 | \
+                              DMA_HIFCR_CTEIF7 | DMA_HIFCR_CDMEIF7 | \
+                              DMA_HIFCR_CFEIF7)
+
 #define CLK_TIM         SSI_CLKIN_TIM      /* TIM8: APB2, so DMA2 reaches GPIO */
 
-/* Tmu gap timer, TIM6, a basic timer on APB1 (90 MHz with the APB1 prescaler
- * != 1). The gap it times is corrected for two things, because it does not
- * start at the reference the specification uses -- see the half-period note by
- * s_period_ns below, and GAP_ISR_OVERHEAD_NS.
- */
-#define GAP_TIM         TIM6
-#define GAP_TIM_IRQn    TIM6_DAC_IRQn
+/* Tmu timer, TIM6, a basic timer on APB1 (90 MHz with the APB1 prescaler
+ * != 1). Every falling edge of the SSI clock resets it in hardware -- see
+ * tmu_init() -- so its overflow means exactly what 5.4.1 defines Tmu as: the
+ * time since the *last falling edge*, however many clocks the master sent. */
+#define TMU_TIM         TIM6
+#define TMU_TIM_IRQn    TIM6_DAC_IRQn
 
-/* 0.1 us tick, so the half-period correction below can be applied with better
- * than microsecond resolution. */
-#define GAP_TICK_NS     100u
-#define GAP_TIM_HZ      (1000000000u / GAP_TICK_NS)
+#define TMU_TICK_NS     100u
+#define TMU_TIM_HZ      (1000000000u / TMU_TICK_NS)
 
-/* Fixed part of the correction: interrupt latency from the last rising edge to
- * gap_timer_start(), plus the latency from the gap timer's update to DATA
- * actually going high. Measured at ~1.6 us, from two captures that agree --
- * 20.89 us at 2 MHz (half period 0.25 us) and 20.85 us at 175.8 kHz (half
- * period 2.89 us), each against a 20 us target. */
-/* Fixed part of the correction: the latency of the two interrupts the gap now
- * costs -- end-of-message to the stage-1 timer start, and the stage-1 update to
- * DATA actually moving -- plus the stage-2 update to DATA going high. Retuned
- * from 1600 ns when the gap gained its second stage: with the old value Tmu ran
- * 21.05 us at 500 kHz and 21.60 us at 2 MHz, against a 20 +/- 1 us window. */
-#define GAP_ISR_OVERHEAD_NS  2600u
-
-/* Lower bound, so a pathologically slow master cannot drive the gap to zero. */
-#define GAP_MIN_NS           1000u
+/* From the Tmu overflow to DATA actually going HIGH: interrupt entry, staging
+ * the next frame and re-arming, all of which happen *before* DATA goes HIGH so
+ * that a master starting the moment it sees HIGH finds the slave ready.
+ *
+ * It is not a constant -- staging SSI6 runs a CRC that SSI4 does not -- so the
+ * handler reads it off the Tmu counter on every Read Cycle and takes it out of
+ * the next one. This is only the value used until the first measurement:
+ * `stat` showed tmu_arm = 4800 ns in 9 samples of 10 and 5300 ns in the tenth,
+ * SSI4 against a 562.5 kHz master. */
+#define TMU_ARM_SEED_NS 4800u
 
 static ssi_slave_config_t    s_cfg;
 static ssi_slave_provider_t  s_provider;
 static void                 *s_ctx;
-static uint8_t               s_nbytes;
 
-/* One BSRR word per message bit. 32 is the longest frame the variants use. */
-static volatile uint32_t     s_bsrr[32];
-static volatile bool         s_armed;
-static volatile uint16_t     s_last_ndtr;
-static volatile uint32_t     s_last_frames;
-static volatile uint32_t     s_last_move;      /* DWT cycles when NDTR last moved */
-static volatile uint32_t     s_frames;
-static volatile uint32_t     s_resyncs;
-static volatile bool         s_gap_level;
-/* 1 = waiting to place the Error Flag, 2 = waiting out the rest of Tmu. */
-static volatile uint8_t      s_gap_stage;
+/* One BSRR word per message bit, then one for the Error Flag. 32 is the
+ * longest frame the variants use. */
+#define SSI_MAX_BITS    32u
+static volatile uint32_t     s_bsrr[SSI_MAX_BITS + 1u];
 
-/* Dynamic half-period correction.
- *
- * Tmu is specified "from last falling edge of clock", but the message ends on
- * the last *rising* edge -- half a clock period later. That term is 0.25 us at
- * the 2 MHz maximum but 5 us at the 100 kHz minimum, so a fixed compensation
- * only holds near the top of the range: below roughly 400 kHz a fixed value
- * pushes Tmu outside its 20 us +/- 1 us window.
+/* What the falling-edge DMA writes into TIM6->EGR. In SRAM, not flash, so the
+ * DMA's read of it does not wait on flash wait states. */
+static uint32_t              s_tmu_ug = TIM_EGR_UG;
+static volatile uint16_t     s_tmu_arr;        /* Tmu less the arming time, in ticks, minus one */
+
+static volatile uint32_t     s_frames;         /* n bits and the Error Flag clocked */
+static volatile uint32_t     s_short;          /* exactly n clocks */
+static volatile uint32_t     s_aborted;        /* fewer than n */
+static volatile uint32_t     s_tmu_arm_ticks;  /* last overflow -> DATA HIGH */
+
+/* Sticky: the counter has actually reached n and ended a message. Set from the
+ * end-of-Read-Cycle handler, which is the only thing that proves it -- an
+ * earlier version polled CNT != 0 instead and was wrong in both directions. It
+ * read "counting" off 11 counts of noise on a floating input that never reached
+ * n, and once the wire was on it read "no edges", because every re-arm resets
+ * CNT to 0 and the poll almost never lands mid-message. The wire this needs is
+ * easy to leave off, and without it the link is simply dead with nothing
+ * pointing at the cause, so `stat` has to answer the question rather than
+ * approximate it. */
+static volatile bool         s_clk_counted;
+
+/* Clock period, for `stat` only -- nothing in the timing depends on it any
+ * more, since Tmu is now timed from the falling edge itself.
  *
  * T comes free from the DATA DMA, which moves exactly one word per rising
  * edge. Its half-transfer event therefore fires a known number of clock
- * periods before transfer-complete, and both run in the same non-critical
- * handler:  T = (t_TC - t_HT) / (periods between them).
- */
-/* Sticky: the counter has actually reached n and ended a message. Set from the
- * update handler, which is the only thing that proves it -- an earlier version
- * polled CNT != 0 instead and was wrong in both directions. It read "counting"
- * off 11 counts of noise on a floating input that never reached n, and once the
- * wire was on it read "no edges", because every re-arm resets CNT to 0 and the
- * poll almost never lands mid-message. The wire this needs is easy to leave
- * off, and without it the link is simply dead with nothing pointing at the
- * cause, so `stat` has to answer the question rather than approximate it. */
-static volatile bool         s_clk_counted;
-
+ * periods before transfer-complete:  T = (t_TC - t_HT) / (periods between).
+ * Only a master that clocks all n+1 bits reaches TC, so a master that stops at
+ * n leaves this at its last value. */
 static volatile uint32_t     s_t_half;         /* DWT cycles at half transfer */
-static volatile uint32_t     s_ht_bits;        /* bits already clocked in at that point */
+static volatile uint32_t     s_ht_bits;        /* words already moved at that point */
 static volatile uint32_t     s_period_ns;      /* measured clock period T */
 static volatile bool         s_period_valid;
 
@@ -90,6 +86,12 @@ static inline void data_drive(bool level)
 {
     SSI_SLAVE_GPIO->BSRR = level ? SSI_SLAVE_DATA_PIN
                                  : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
+}
+
+static inline uint32_t bsrr_word(bool level)
+{
+    return level ? (uint32_t)SSI_SLAVE_DATA_PIN
+                 : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
 }
 
 /* --- frame staging -------------------------------------------------------- */
@@ -107,33 +109,34 @@ static void stage_frame(void)
      * of any other pin in the port -- which is the register-sharing trap that
      * bit us in EXTI3_IRQHandler, avoided here by construction. */
     for (uint8_t i = 0; i < s_cfg.n_bits; i++) {
-        uint32_t bit = (f.payload >> (s_cfg.n_bits - 1u - i)) & 1u;
-        s_bsrr[i] = bit ? (uint32_t)SSI_SLAVE_DATA_PIN
-                        : ((uint32_t)SSI_SLAVE_DATA_PIN << 16u);
+        s_bsrr[i] = bsrr_word(((f.payload >> (s_cfg.n_bits - 1u - i)) & 1u) != 0u);
     }
 
-    /* Note 3 of section 5.4.1: after the last rising edge the data line is set
-     * by the Error Flag. PV is the inverse of the ERROR FLAG, so a valid
-     * measurement drives DATA low during the gap. */
-    s_gap_level = f.error_flag;
+    /* The Error Flag is simply bit n+1.
+     *
+     * 5.4.1 note 3 sets the data line to the Error Flag "after the last rising
+     * edge of the clock sequence", and the Read Cycle runs Trc = n*T + 0.5*T
+     * from the first falling edge -- n+1 clock periods, so the last rising edge
+     * is R(n+1). Each rising edge transmits the next bit (note 2), so the same
+     * DMA that shifted D0 out on R(n) puts the flag out on R(n+1), +56 ns like
+     * every other bit, with no interrupt. D0 stays on the line through F(n+1),
+     * where the master samples it.
+     *
+     * PV is the inverse of the ERROR FLAG, so a valid measurement drives DATA
+     * LOW for the rest of Tmu. */
+    s_bsrr[s_cfg.n_bits] = bsrr_word(f.error_flag);
 }
 
 /* --- arming --------------------------------------------------------------- */
-
-static inline void clock_counter_arm(void);
 
 /* Stop the DATA DMA without it reporting an end of message.
  *
  * Clearing EN on a live memory-to-peripheral stream sets TCIF [RM0390 Rev 9
  * 9.3.14 and 9.3.15, p.216]. With TCIE on, every re-arm therefore raised a
  * transfer-complete interrupt that the handler took for the end of a real
- * message: it started the Error Flag and Tmu sequence mid-frame, and measured
- * T from a half-transfer timestamp left over from an earlier message. Captured
- * against a 562.5 kHz master, that put a 3.7 us LOW pulse ~14 us after the
- * last rising edge where the Error Flag should hold the line for ~17 us.
- *
- * TCIE and HTIE are not protected bits [RM0390 Rev 9 DMA_SxCR, p.226], so they
- * go off in the same write as EN, and anything already pended goes with them. */
+ * message. TCIE and HTIE are not protected bits [RM0390 Rev 9 DMA_SxCR,
+ * p.226], so they go off in the same write as EN, and anything already pended
+ * goes with them. */
 static void data_dma_halt(void)
 {
     SSI_DATA_DMA_STREAM->CR &= ~(DMA_SxCR_EN | SSI_DATA_IRQ_ENABLES);
@@ -145,22 +148,17 @@ static void data_dma_halt(void)
 /* Arm one message: the DATA DMA reloads, then the edge counter starts.
  *
  * There is no pin handover and no shift register here. PB4 stays a GPIO output
- * throughout; the only thing that changes is who writes it -- software during
- * the gap, the DMA during the message. So nothing has to happen at the first
- * falling edge, which is why this build has no EXTI3 handler and none of its
- * 250 ns deadline. The first rising edge writes D(n-1) by itself. */
+ * throughout; the only thing that changes is who writes it -- software between
+ * Read Cycles, the DMA during one. The first rising edge writes D(n-1) by
+ * itself.
+ *
+ * The data request is masked before the stream is touched: a request raised
+ * while the stream is disabled is lost, after which the stream sits at its
+ * reload value and never moves again. Unmask only once the stream is loaded
+ * and enabled. The falling-edge request (CC4) is left alone -- it only ever
+ * resets the Tmu timer. */
 static void ssi_arm(void)
 {
-    /* Silence the request source before touching the stream.
-     *
-     * TIM3 free-runs with ARR=0, so every counted edge is an update and every
-     * update is a DMA request. Reloading the stream while that source is still
-     * live leaves a request able to appear across the re-arm -- and a request
-     * raised while the stream is disabled is simply lost, after which the
-     * stream sits at its reload value and never moves again. That is the
-     * observed failure: one good message, then NDTR parked at n with the
-     * watchdog seeing an idle count and nothing to resync. Mask UDE first, and
-     * unmask only once the stream is loaded and enabled. */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
     CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
     CLK_TIM->SR    = 0;
@@ -169,17 +167,29 @@ static void ssi_arm(void)
     s_ht_bits = 0;      /* no half-transfer seen in this message yet */
 
     SSI_DATA_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)s_bsrr;
-    SSI_DATA_DMA_STREAM->NDTR = s_cfg.n_bits;
+    SSI_DATA_DMA_STREAM->NDTR = (uint32_t)s_cfg.n_bits + 1u;
     SSI_DATA_DMA_STREAM->CR  |= SSI_DATA_IRQ_ENABLES | DMA_SxCR_EN;
 
-
-    /* The gap level is already on the pin; leave it there until the first
-     * rising edge overwrites it with D(n-1). */
     CLK_TIM->CNT   = 0;
     CLK_TIM->SR    = 0;
-    CLK_TIM->DIER |= TIM_DIER_CC2DE;
+    CLK_TIM->DIER |= TIM_DIER_CC2DE | TIM_DIER_CC4DE;
     CLK_TIM->CR1  |= TIM_CR1_CEN;
-    s_armed = true;
+}
+
+/* Park the Tmu timer between Read Cycles.
+ *
+ * TIM6 runs continuously and every falling edge resets it, so between Read
+ * Cycles -- no edges at all -- it would overflow every Tmu for nothing. Parking
+ * puts a 0xFFFF period in the shadow register with UG, then leaves Tmu in the
+ * preload. The first falling edge of the next Read Cycle writes UG again, which
+ * resets the counter *and* loads that Tmu [RM0390 Rev 9 19.4.1 ARPE and 19.4.5
+ * UG, p.624-627], so the cycle is timed exactly while an idle line costs one
+ * interrupt every 6.5 ms. URS=1 keeps both UGs from raising an interrupt. */
+static void tmu_park(void)
+{
+    TMU_TIM->ARR = 0xFFFFu;
+    TMU_TIM->EGR = TIM_EGR_UG;
+    TMU_TIM->ARR = s_tmu_arr;
 }
 
 /* --- init ----------------------------------------------------------------- */
@@ -196,7 +206,7 @@ static void gpio_init(void)
      * it through BSRR and nothing ever hands it to a peripheral, so there is no
      * alternate function to program and no mode to flip mid-frame. The clock is
      * not read here at all -- it clocks TIM8 through PC6, set up in
-     * clock_input_init(). */
+     * clock_counter_init(). */
     io.Pin   = SSI_SLAVE_DATA_PIN;
     io.Mode  = GPIO_MODE_OUTPUT_PP;
     io.Pull  = GPIO_NOPULL;
@@ -208,11 +218,9 @@ static void gpio_init(void)
     data_drive(true);
 }
 
-
-
 /* TIM8 clocked by the SSI clock on TI1F_ED: one count per *edge*, ARR = 1, so
  * a channel-2 compare lands on every rising edge to drive the DATA DMA and a
- * channel-4 compare on every falling edge to place the Error Flag. */
+ * channel-4 compare on every falling edge to reset the Tmu timer. */
 static void clock_counter_init(void)
 {
     GPIO_InitTypeDef io = {0};
@@ -245,41 +253,25 @@ static void clock_counter_init(void)
      * edge detector: it pulses on *both* edges of TI1, so the counter advances
      * at twice the bit rate. CC1S=01 maps the pin to IC1 so the detector sees
      * it; the capture value itself is never read, only the edges matter. */
-    /* Channel 1 is the input the counter is clocked from; channel 2 is an
-     * output compare left frozen (OC2M=000), used only for the event it raises.
-     * CCR2=0 matches when the counter wraps 1 -> 0, which is the rising edge --
-     * the same instant as the update event, but a compare event repeats where
-     * the update event was measured to fire exactly once. */
+    /* Channels 2 and 4 are output compares left frozen (OCxM=000), used only
+     * for the events they raise -- a compare event repeats where the update
+     * event was measured to fire exactly once. CCR2=0 matches when the counter
+     * wraps 1 -> 0, the rising edge; CCR4=1 matches when it steps 0 -> 1, the
+     * falling edge. */
     CLK_TIM->CCMR1 = TIM_CCMR1_CC1S_0;
-    CLK_TIM->CCR2  = 0u;    /* counter at 0: a rising edge -> next data bit */
+    CLK_TIM->CCMR2 = 0u;
+    CLK_TIM->CCR2  = 0u;    /* counter at 0: a rising edge  -> next data bit */
+    CLK_TIM->CCR4  = 1u;    /* counter at 1: a falling edge -> Tmu restarts */
     CLK_TIM->SMCR  = TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1 | TIM_SMCR_SMS_2
                    | TIM_SMCR_TS_2;
 
     CLK_TIM->EGR = TIM_EGR_UG;             /* load PSC/ARR */
     CLK_TIM->SR  = 0;                      /* UG set UIF; drop it */
-    CLK_TIM->DIER = TIM_DIER_CC2DE;        /* one request per rising edge */
-
-    /* Same priority as the receive DMA's end-of-message interrupt it replaces:
-     * above everything except the EXTI3 handover, which it must never preempt
-     * -- equal preemption priority, higher subpriority. */
+    CLK_TIM->DIER = 0;                     /* ssi_arm() enables the requests */
 }
 
-/* Restarts the count for one message. The counter must be zeroed rather than
- * left to free-run: anything that toggles the clock pin between messages --
- * the loopback continuity test, above all -- would otherwise carry a count
- * into the next frame and end it early. */
-static inline void clock_counter_arm(void)
-{
-    CLK_TIM->CR1 &= ~TIM_CR1_CEN;
-    CLK_TIM->CNT  = 0;
-    CLK_TIM->SR   = 0;
-    CLK_TIM->CR1 |= TIM_CR1_CEN;
-}
-
-static void gap_timer_start(void);
-
-/* DMA1 Stream 2 Channel 5 = TIM3_UP [RM0390 Rev 9 Table 28], memory to
- * peripheral, one 32-bit word per clock edge into GPIOB->BSRR. */
+/* DMA2 Stream 3 Channel 7 = TIM8_CH2 [RM0390 Rev 9 Table 29], memory to
+ * peripheral, one 32-bit word per rising edge into GPIOB->BSRR. */
 static void data_dma_init(void)
 {
     __HAL_RCC_DMA2_CLK_ENABLE();
@@ -301,8 +293,56 @@ static void data_dma_init(void)
     HAL_NVIC_EnableIRQ(SSI_DATA_DMA_IRQn);
 }
 
-/* End of message: the DMA has written all n bits, so the last rising edge has
- * just happened. 5.4.1 note 3 puts the Error Flag here. */
+/* Tmu, timed from the last falling edge by hardware.
+ *
+ * The previous gap timer started from the end of the message and corrected for
+ * where it thought the last falling edge was. That broke as soon as a master
+ * sent n+1 clocks -- which 5.4.1 requires -- and would break further for any
+ * that clocks a whole number of bytes past it, as an SPI master does.
+ *
+ * Here the falling edges themselves restart Tmu: TIM8's channel-4 compare
+ * raises a DMA request on every falling edge, and a circular one-word stream
+ * writes UG into TIM6->EGR, which resets its counter [RM0390 Rev 9 19.4.5].
+ * TIM6 is on APB1, which the DMA2 peripheral bus reaches [RM0390 Rev 9 2.1.5,
+ * p.55]. When no falling edge has come for Tmu, TIM6 overflows and its handler
+ * ends the Read Cycle. No interrupt runs per edge.
+ *
+ * TIM8_CH4 -> DMA2 Stream 7, Channel 7 [RM0390 Rev 9 Table 29]. */
+static void tmu_init(void)
+{
+    __HAL_RCC_TIM6_CLK_ENABLE();
+
+    uint32_t ticks = ((uint32_t)s_cfg.tmu_us * 1000u - TMU_ARM_SEED_NS) / TMU_TICK_NS;
+    s_tmu_arr = (uint16_t)(ticks - 1u);
+
+    TMU_TIM->CR1  = 0;
+    TMU_TIM->PSC  = (APB1_TIMCLK_HZ / TMU_TIM_HZ) - 1u;   /* 0.1 us per tick */
+    TMU_TIM->CR1  = TIM_CR1_ARPE | TIM_CR1_URS;
+    tmu_park();                     /* the UG in it loads PSC as well */
+    TMU_TIM->SR   = 0;
+    TMU_TIM->DIER = TIM_DIER_UIE;
+
+    SSI_TMU_DMA_STREAM->CR = 0;
+    while (SSI_TMU_DMA_STREAM->CR & DMA_SxCR_EN) { }
+    DMA2->HIFCR = SSI_TMU_CLEAR_FLAGS;
+    SSI_TMU_DMA_STREAM->PAR  = (uint32_t)(uintptr_t)&TMU_TIM->EGR;
+    SSI_TMU_DMA_STREAM->M0AR = (uint32_t)(uintptr_t)&s_tmu_ug;
+    SSI_TMU_DMA_STREAM->NDTR = 1u;
+    SSI_TMU_DMA_STREAM->FCR  = 0;
+    SSI_TMU_DMA_STREAM->CR   = (SSI_TMU_DMA_CHANNEL << DMA_SxCR_CHSEL_Pos)
+                             | DMA_SxCR_DIR_0            /* memory -> periph */
+                             | DMA_SxCR_CIRC             /* every falling edge */
+                             | DMA_SxCR_PSIZE_1          /* 32-bit */
+                             | DMA_SxCR_MSIZE_1
+                             | DMA_SxCR_PL_1;            /* high: below DATA */
+    SSI_TMU_DMA_STREAM->CR  |= DMA_SxCR_EN;
+
+    HAL_NVIC_SetPriority(TMU_TIM_IRQn, 0, 2);
+    HAL_NVIC_EnableIRQ(TMU_TIM_IRQn);
+}
+
+/* DATA has carried all n bits and then the Error Flag: R(n+1) has passed. Only
+ * the clock period is measured here; the Read Cycle ends when Tmu says so. */
 void DMA2_Stream3_IRQHandler(void)
 {
     /* Half transfer: timestamp only. One word per rising edge, so the interval
@@ -311,38 +351,24 @@ void DMA2_Stream3_IRQHandler(void)
         DMA2->LIFCR = DMA_LIFCR_CHTIF3;
         s_t_half  = DWT->CYCCNT;
         /* How far the transfer actually got, rather than assuming half: an odd
-         * n would not land on n/2. */
-        s_ht_bits = (uint32_t)s_cfg.n_bits - (uint32_t)SSI_DATA_DMA_STREAM->NDTR;
+         * count would not land on the middle. */
+        s_ht_bits = (uint32_t)s_cfg.n_bits + 1u - (uint32_t)SSI_DATA_DMA_STREAM->NDTR;
     }
 
     if (DMA2->LISR & DMA_LISR_TCIF3) {
         uint32_t elapsed = DWT->CYCCNT - s_t_half;
+        uint32_t words   = (uint32_t)s_cfg.n_bits + 1u;
 
-        /* Stop the request source in the same breath as ending the message, so
-         * nothing can be raised during the gap that survives into the re-arm. */
-        CLK_TIM->CR1  &= ~TIM_CR1_CEN;
+        /* Stop the data requests. TIM8 keeps counting, so any further clocks
+         * still restart Tmu through channel 4. */
         CLK_TIM->DIER &= ~TIM_DIER_CC2DE;
-
-        /* The Error Flag is not placed here -- the gap timer does it, see
-         * gap_timer_start(). Driving it in this handler puts it on the line a
-         * fixed ~0.4 us after the last rising edge, which is too early at
-         * every rate below about 1 MHz and destroys the last data bit.
-         *
-         * It was also tried as a second DMA on a channel-4 compare, one word
-         * per falling edge from a buffer of n no-ops then the flag. That
-         * cannot work either: the flag sits at index n, so it needs an
-         * (n+1)'th falling edge, and a Read Cycle of n clock periods has n.
-         * Measured, the gap then held the stale last data bit and did not
-         * track PV at all -- with PV=0 it read LOW in 182 of 197 cycles. */
-        SSI_DATA_DMA_STREAM->CR &= ~DMA_SxCR_EN;
         DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
-        /* The interval spans however many rising edges remained after the
-         * half-transfer event, which s_ht_bits records exactly. ssi_arm()
-         * zeroes it, so a message whose half-transfer was never seen -- or was
-         * served together with TC -- keeps the last good T rather than
-         * dividing a stale timestamp. */
-        if (s_ht_bits > 0u && s_ht_bits < s_cfg.n_bits) {
-            uint32_t span = (uint32_t)(s_cfg.n_bits - s_ht_bits);
+
+        /* ssi_arm() zeroes s_ht_bits, so a message whose half-transfer was
+         * never seen -- or was served together with TC -- keeps the last good
+         * T rather than dividing a stale timestamp. */
+        if (s_ht_bits > 0u && s_ht_bits < words) {
+            uint32_t span = words - s_ht_bits;
             /* ns per cycle is 1000/180 = 5.56, so scale before dividing -- the
              * other order truncates to 5 and reports every period 10% short. */
             uint32_t per_ns = (elapsed * 1000u) / (span * (SYSCLK_HZ / 1000000u));
@@ -351,81 +377,68 @@ void DMA2_Stream3_IRQHandler(void)
                 s_period_valid = true;
             }
         }
-
-        s_armed = false;
-        s_frames++;
-        s_clk_counted = true;
-        gap_timer_start();
     } else {
         DMA2->LIFCR = SSI_DATA_CLEAR_FLAGS;
     }
 }
 
-static void gap_timer_init(void)
+/* Tmu has elapsed since the last falling edge: the Read Cycle is over, however
+ * many clocks it had. Latest position data becomes available and DATA returns
+ * HIGH (5.4.1 note 4). */
+void TIM6_DAC_IRQHandler(void)
 {
-    __HAL_RCC_TIM6_CLK_ENABLE();
-
-    GAP_TIM->CR1 = 0;
-    GAP_TIM->PSC = (APB1_TIMCLK_HZ / GAP_TIM_HZ) - 1u;   /* 0.1 us per tick */
-    GAP_TIM->ARR = (s_cfg.tmu_us * 1000u) / GAP_TICK_NS; /* replaced per frame */
-    GAP_TIM->EGR = TIM_EGR_UG;      /* load PSC/ARR */
-    GAP_TIM->SR  = 0;               /* UG set UIF; drop it */
-    GAP_TIM->CR1 = TIM_CR1_OPM;     /* one pulse: stops itself at update */
-    GAP_TIM->DIER = TIM_DIER_UIE;
-
-    HAL_NVIC_SetPriority(GAP_TIM_IRQn, 0, 2);
-    HAL_NVIC_EnableIRQ(GAP_TIM_IRQn);
-}
-
-/* Programs the gap so that DATA returns HIGH one Tmu after the last *falling*
- * edge, given the clock period measured during this frame. */
-/* Floor for the short first stage. GAP_MIN_NS is the floor for the whole gap
- * and is far too coarse here: at 2 MHz three quarters of a period is 375 ns,
- * and clamping that up to 1 us pushed Tmu 0.6 us long on its own. */
-#define GAP_STAGE_MIN_NS  200u
-
-static inline void gap_timer_fire_in(uint32_t ns, uint32_t floor_ns)
-{
-    if (ns < floor_ns) {
-        ns = floor_ns;
+    if ((TMU_TIM->SR & TIM_SR_UIF) == 0u) {
+        return;
     }
-    GAP_TIM->ARR  = (ns / GAP_TICK_NS) - 1u;
-    GAP_TIM->CNT  = 0;
-    GAP_TIM->SR   = 0;
-    GAP_TIM->CR1 |= TIM_CR1_CEN;
-}
+    TMU_TIM->SR = 0;
 
-/* How long after the last rising edge the Error Flag may take the line.
- *
- * Not a constant. The controller samples the last data bit D0 in the phase
- * that follows the edge that set it -- half a clock period later -- so a fixed
- * delay is right at one rate and wrong at every other. Measured at 500 kHz, a
- * fixed 416 ns put the flag on the line 567 ns before the test master sampled
- * D0, and `fixed 0x3FFFFF` in SSI1 (where D0 is PD[0], unlike SSI4 where it is
- * the near-constant TS[0]) read back 0x3FFFFE every frame: the last bit was
- * being destroyed in every message.
- *
- * Three quarters of a period clears the sampling point by a comfortable margin
- * at every rate in the window, and still leaves the flag on the line for the
- * rest of Tmu. */
-static inline uint32_t flag_delay_ns(void)
-{
-    uint32_t t = s_period_valid ? s_period_ns : 500u;   /* assume 2 MHz first */
-    return (t * 3u) / 4u;
-}
+    const uint32_t words = (uint32_t)s_cfg.n_bits + 1u;
+    const uint32_t left  = SSI_DATA_DMA_STREAM->NDTR;
 
-/* Stage 1 of the gap: wait out the sampling window, then let the Error Flag
- * take the line. The remainder of Tmu is stage 2, in the handler. */
-static void gap_timer_start(void)
-{
-    s_gap_stage = 1u;
-    gap_timer_fire_in(flag_delay_ns(), GAP_STAGE_MIN_NS);
+    if (left == words && CLK_TIM->CNT == 0u) {
+        /* Not a single edge since the last arm: the parked overflow. */
+        tmu_park();
+        return;
+    }
+
+    /* Classify by how far the DATA DMA got. A master that sends only n clocks
+     * gets D0 out but never clocks the Error Flag, and its first sample -- at
+     * F1 or right at R1 -- was the idle level, not D(n-1). It is worth
+     * counting separately because it decodes as a frame shifted by one bit. */
+    if (left == 0u) {
+        s_frames++;
+    } else if (left == 1u) {
+        s_short++;
+    } else {
+        s_aborted++;
+    }
+    if (left <= 1u) {
+        s_clk_counted = true;
+    }
+
+    /* Ready before DATA says so: a master may start the next Read Cycle the
+     * moment it sees HIGH. */
+    stage_frame();
+    ssi_arm();
+
+    /* The counter has been running since the overflow, so it now holds what
+     * the two calls above cost. Take that out of the next Read Cycle's Tmu.
+     * Bounded, so one freak reading cannot collapse the gap. */
+    const uint32_t arm = TMU_TIM->CNT;
+    const uint32_t tmu = ((uint32_t)s_cfg.tmu_us * 1000u) / TMU_TICK_NS;
+    s_tmu_arm_ticks = arm;
+    if (arm < tmu / 2u) {
+        s_tmu_arr = (uint16_t)(tmu - arm - 1u);
+    }
+
+    tmu_park();
+    data_drive(true);
 }
 
 bool ssi_slave_init(const ssi_slave_config_t *cfg,
                     ssi_slave_provider_t provider, void *ctx)
 {
-    if (cfg == NULL || cfg->n_bits == 0u || cfg->n_bits > 32u ||
+    if (cfg == NULL || cfg->n_bits == 0u || cfg->n_bits > SSI_MAX_BITS ||
         (cfg->n_bits % 8u) != 0u || cfg->tmu_us == 0u) {
         return false;
     }
@@ -433,10 +446,9 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     s_cfg      = *cfg;
     s_provider = provider;
     s_ctx      = ctx;
-    s_nbytes   = (uint8_t)(cfg->n_bits / 8u);
     s_frames   = 0;
-    s_resyncs  = 0;
-    s_armed    = false;
+    s_short    = 0;
+    s_aborted  = 0;
 
     /* Cycle counter, used to measure the master's clock period. */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -446,7 +458,7 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     gpio_init();
     data_dma_init();
     clock_counter_init();
-    gap_timer_init();
+    tmu_init();
     return true;
 }
 
@@ -457,148 +469,52 @@ void ssi_slave_stop(void)
      * The loopback continuity test drives PB4 and toggles the clock pin, and
      * the clock reaches PC6 -- so without this, TIM8 counts those edges and the
      * DATA DMA writes PB4 from under the test, which reports the wire OPEN when
-     * it is fine. The old SPI path had the same hazard through EXTI3 and masked
-     * it the same way. */
+     * it is fine. */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
     CLK_TIM->DIER  = 0;
     CLK_TIM->SR    = 0;
 
-    /* Halted rather than just disabled: a bare EN clear raises TC (see
-     * data_dma_halt), which the handler would count as a message -- setting
-     * s_clk_counted, so `stat` would call the clock wire good after `wire`
-     * whether or not it had ever carried one. */
     data_dma_halt();
 
-    GAP_TIM->CR1 &= ~TIM_CR1_CEN;
-    GAP_TIM->SR   = 0;
-    s_gap_stage   = 0u;
-
-    s_armed = false;
+    TMU_TIM->CR1 &= ~TIM_CR1_CEN;
+    TMU_TIM->SR   = 0;
+    NVIC_ClearPendingIRQ(TMU_TIM_IRQn);
 }
 
 void ssi_slave_start(void)
 {
-    data_drive(true);
     stage_frame();
     ssi_arm();
+    tmu_park();
+    TMU_TIM->SR   = 0;
+    TMU_TIM->CR1 |= TIM_CR1_CEN;
+    data_drive(true);
 }
 
 bool ssi_slave_set_frame_bits(uint8_t n_bits)
 {
-    if (n_bits == 0u || n_bits > 32u || (n_bits % 8u) != 0u) {
+    if (n_bits == 0u || n_bits > SSI_MAX_BITS || (n_bits % 8u) != 0u) {
         return false;
     }
 
-    /* Stop the gap timer first: its handler re-arms, and it must not fire
-     * between the config change and the fresh arm below. */
-    GAP_TIM->CR1 &= ~TIM_CR1_CEN;
-    GAP_TIM->SR   = 0;
-
+    /* Stop first: the Tmu handler re-arms, and it must not run between the
+     * config change and the fresh arm below. */
+    ssi_slave_stop();
     s_cfg.n_bits = n_bits;
-    s_nbytes     = (uint8_t)(n_bits / 8u);
-
     ssi_slave_start();
     return true;
 }
 
-void ssi_slave_poll(void)
-{
-    if (!s_armed) {
-        return;
-    }
-
-    /* A healthy link either sits at NDTR == n (no cycle in progress) or moves
-     * NDTR once per clock period, and 1/T is 100 kHz .. 2 MHz (IncOder 5.4.1),
-     * so at most every 10 us. A message that has stood still for Tmu = 20 us
-     * has been abandoned: that is two periods at the slowest legal rate, and
-     * 5.4.1 makes any gap longer than Tmu an intermessage gap (Timg > Tmu).
-     * Drop it and re-arm, or the framing stays skewed for every later cycle.
-     *
-     * The threshold has to be a time. This used to fire whenever two passes of
-     * the main loop read the same NDTR -- and the loop runs in a few hundred
-     * ns, far inside one bit period, so with an external master it re-armed
-     * after nearly every bit and the frame restarted from D(n-1) every three
-     * to five bits (562.5 kHz capture: 40% of DATA writes on falling edges,
-     * TS never advancing). The loopback never showed it because `read` and
-     * `burst` block the main loop while the test master clocks.
-     *
-     * Time is read before NDTR: if an interrupt lands between the two, NDTR is
-     * the fresher reading and a stall can only be under-estimated. s_frames
-     * catches a whole message slipping by while the loop was held up, which
-     * could leave NDTR back at the value it had before. */
-    uint32_t now    = DWT->CYCCNT;
-    uint16_t ndtr   = (uint16_t)SSI_DATA_DMA_STREAM->NDTR;
-    uint32_t frames = s_frames;
-
-    if (ndtr == s_cfg.n_bits || ndtr != s_last_ndtr || frames != s_last_frames) {
-        s_last_ndtr   = ndtr;
-        s_last_frames = frames;
-        s_last_move   = now;
-        return;
-    }
-
-    if ((now - s_last_move) < (uint32_t)s_cfg.tmu_us * (SYSCLK_HZ / 1000000u)) {
-        return;
-    }
-
-    s_resyncs++;
-    data_drive(true);
-    stage_frame();
-    ssi_arm();
-    s_last_ndtr = s_cfg.n_bits;
-}
-
 void ssi_slave_get_stats(ssi_slave_stats_t *out)
 {
-    out->frames    = s_frames;
-    out->resyncs   = s_resyncs;
-    out->period_ns = s_period_valid ? s_period_ns : 0u;
+    out->frames      = s_frames;
+    out->short_reads = s_short;
+    out->aborted     = s_aborted;
+    out->period_ns   = s_period_valid ? s_period_ns : 0u;
+    out->tmu_arm_ns  = s_tmu_arm_ticks * TMU_TICK_NS;
 }
 
-/* --- interrupts ----------------------------------------------------------- */
-
-/* End of message, whichever detector saw it: all n clocks have been counted.
- * Both callers run at the same instant -- the last rising edge -- so the gap
- * correction below is the same either way. */
-
-
-/* Lives outside the handler guard above: with SIMENC_TIMER_DATA the DMA ends
- * the message and TIM3 raises no interrupt at all, but the question this
- * answers -- did the ETR wire ever carry a full message -- is the same. */
 bool ssi_slave_clock_counter_ok(void)
 {
     return s_clk_counted;
-}
-
-/* Tmu elapsed: latest position data is now available, DATA returns HIGH and a
- * new Read Cycle may start. */
-void TIM6_DAC_IRQHandler(void)
-{
-    if ((GAP_TIM->SR & TIM_SR_UIF) == 0u) {
-        return;
-    }
-    GAP_TIM->SR = 0;
-
-    if (s_gap_stage == 1u) {
-        /* The controller has had its half period to sample D0; the line is the
-         * Error Flag's now. */
-        data_drive(s_gap_level);
-        s_gap_stage = 2u;
-
-        /* Tmu is specified from the last *falling* edge, which is half a clock
-         * period before the last rising edge this gap started from. Subtract
-         * that, the delay just spent, and the fixed interrupt overhead. */
-        uint32_t want = s_cfg.tmu_us * 1000u;
-        uint32_t sub  = GAP_ISR_OVERHEAD_NS + flag_delay_ns()
-                      + (s_period_valid ? s_period_ns / 2u : 250u);
-        gap_timer_fire_in((want > sub + GAP_MIN_NS) ? (want - sub) : GAP_MIN_NS,
-                          GAP_MIN_NS);
-        return;
-    }
-
-    /* Tmu elapsed: DATA returns HIGH and a new Read Cycle may start. */
-    s_gap_stage = 0u;
-    data_drive(true);
-    stage_frame();
-    ssi_arm();
 }

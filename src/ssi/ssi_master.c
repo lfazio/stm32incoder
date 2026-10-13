@@ -95,7 +95,7 @@ static uint32_t s_x_n = X_N_DEFAULT;  /* timer period in APB2 timer ticks */
 
 static const uint32_t s_clk_low  = (uint32_t)SSI_MASTER_SCK_PIN << 16u;
 static const uint32_t s_clk_high = (uint32_t)SSI_MASTER_SCK_PIN;
-static volatile uint32_t s_idr[32];
+static volatile uint32_t s_idr[33];   /* n data samples, then the Error Flag */
 
 static uint32_t s_dbg_ndtr_lo, s_dbg_ndtr_hi, s_dbg_ndtr_smp;
 static uint32_t s_dbg_tim_cnt, s_dbg_tim_sr, s_dbg_lisr, s_dbg_hisr;
@@ -152,7 +152,7 @@ static void x_stream_setup(DMA_Stream_TypeDef *st, uint32_t par, uint32_t m0ar,
              | cr_extra;
 }
 
-bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
+bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw, bool *ef)
 {
     if (n_bits == 0u || n_bits > 32u) {
         return false;
@@ -175,7 +175,9 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     X_TIM->CCR3 = (s_x_n / 2u) + 1u; /* rising edge, half a period later */
     /* Late in the high phase, just before the next falling edge, which is
      * where an SSI controller reads: the bit was set on the rising edge and
-     * stays valid across the fall.
+     * stays valid across the fall. Sampling here in clock period k is reading
+     * at F(k+1), so with n+1 periods the samples are D(n-1)..D0 and then the
+     * Error Flag, which R(n+1) put on the line.
      *
      * Sampling one tick *after* the rising edge -- which this used to do --
      * reads whatever was on the line before that edge, i.e. the previous bit.
@@ -195,12 +197,18 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     DMA2->LIFCR = X_LOW_CLEAR;
     DMA2->HIFCR = X_HIGH_CLEAR | X_SMPL_CLEAR;
 
+    /* n+1 clock periods: Trc = n*T + 0.5*T from the first falling edge to the
+     * last rising edge (5.4.1). This used to send n, which leaves D0 to be
+     * read without a falling edge after it and never clocks the Error Flag;
+     * a master built that way reads every frame one bit late. */
+    const uint16_t periods = (uint16_t)(n_bits + 1u);
+
     x_stream_setup(X_LOW_STREAM,  (uint32_t)(uintptr_t)&GPIOB->BSRR,
-                   (uint32_t)(uintptr_t)&s_clk_low,  DMA_SxCR_DIR_0, n_bits);
+                   (uint32_t)(uintptr_t)&s_clk_low,  DMA_SxCR_DIR_0, periods);
     x_stream_setup(X_HIGH_STREAM, (uint32_t)(uintptr_t)&GPIOB->BSRR,
-                   (uint32_t)(uintptr_t)&s_clk_high, DMA_SxCR_DIR_0, n_bits);
+                   (uint32_t)(uintptr_t)&s_clk_high, DMA_SxCR_DIR_0, periods);
     x_stream_setup(X_SAMPLE_STREAM, (uint32_t)(uintptr_t)&GPIOB->IDR,
-                   (uint32_t)(uintptr_t)s_idr, DMA_SxCR_MINC, n_bits);
+                   (uint32_t)(uintptr_t)s_idr, DMA_SxCR_MINC, periods);
 
     X_LOW_STREAM->CR    |= DMA_SxCR_EN;
     X_HIGH_STREAM->CR   |= DMA_SxCR_EN;
@@ -209,7 +217,8 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
     X_TIM->DIER = TIM_DIER_CC1DE | TIM_DIER_CC3DE | TIM_DIER_CC4DE;
     X_TIM->CR1  = TIM_CR1_CEN;
 
-    /* n_bits x 500 ns is 16 us for a 32-bit frame; bail out far beyond that. */
+    /* n+1 periods is 330 us for a 32-bit frame at the 100 kHz minimum; bail
+     * out far beyond that. */
     uint32_t guard = 0;
     while ((DMA2->HISR & DMA_HISR_TCIF4) == 0u) {
         if (++guard > 200000u) {
@@ -248,6 +257,9 @@ bool ssi_master_read_timer(uint8_t n_bits, uint32_t *raw)
         }
     }
     *raw = v;
+    if (ef != NULL) {
+        *ef = (s_idr[n_bits] & SSI_MASTER_MISO_PIN) != 0u;
+    }
     return true;
 }
 

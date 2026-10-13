@@ -1,8 +1,8 @@
 /* SSI master -- loopback test harness only, not part of the emulated encoder.
  *
- * Drives a Read Cycle exactly as an SSI controller would: n clock pulses at a
- * rate inside the specified 100 kHz .. 2 MHz window, then an intermessage gap
- * longer than Tmu. Used to validate the slave first by jumper loopback at TTL
+ * Drives a Read Cycle exactly as an SSI controller would: n+1 clock pulses
+ * (Trc = n*T + 0.5*T, 5.4.1) at a rate inside the specified 100 kHz .. 2 MHz
+ * window, then an intermessage gap longer than Tmu. Used to validate the slave first by jumper loopback at TTL
  * level on this board, and afterwards through a pair of MAX490 RS-422
  * transceivers.
  *
@@ -31,8 +31,9 @@ void ssi_master_delay_us(uint32_t us);
  * exact, including 2.000 MHz at the top of the SSI window. DATA is captured by
  * a third DMA reading GPIOB->IDR, late in the high phase -- where an SSI
  * controller samples, since the encoder sets each bit on the rising edge and it
- * stays valid across the fall. */
-bool     ssi_master_read_timer(uint8_t n_bits, uint32_t *raw);
+ * stays valid across the fall. The (n+1)th sample is the Error Flag; ef may
+ * be NULL. */
+bool     ssi_master_read_timer(uint8_t n_bits, uint32_t *raw, bool *ef);
 uint32_t ssi_master_exact_hz(void);
 
 /* Sets the clock rate, anywhere in 100 kHz .. 2 MHz in steps of 180 MHz / N.

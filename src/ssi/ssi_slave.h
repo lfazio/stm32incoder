@@ -21,11 +21,12 @@
  *
  * Implementation: no peripheral shifts the bits. The incoming SSI clock drives
  * TIM8 through its channel-1 edge detector, counting both edges, and two
- * compare channels raise DMA requests that write GPIOB->BSRR -- one per rising
- * edge for the next data bit, one per falling edge for the Error Flag slot.
- * DATA is therefore set on the rising edge, as 5.4.1 note 2 requires, and the
- * DMA's transfer-complete marks the end of the n-bit message. No interrupt runs
- * per bit, and the data pin never changes owner mid-frame.
+ * compare channels raise DMA requests. One per rising edge writes the next
+ * word to GPIOB->BSRR: D(n-1)..D0 on R1..R(n), then the Error Flag on R(n+1),
+ * since a Read Cycle is n+1 clock periods (Trc = n*T + 0.5*T). One per falling
+ * edge writes UG into TIM6, so Tmu is timed in hardware from the last falling
+ * edge, whatever the number of clocks. TIM6 overflowing ends the Read Cycle.
+ * No interrupt runs per bit, and the data pin never changes owner mid-frame.
  */
 #ifndef SIMENC_SSI_SLAVE_H
 #define SIMENC_SSI_SLAVE_H
@@ -40,7 +41,8 @@ typedef struct {
 } ssi_slave_frame_t;
 
 /* Called to fetch the frame that the next Read Cycle will transmit.
- * Runs in interrupt context at end-of-frame: keep it short. */
+ * Runs in interrupt context at the end of Tmu, before DATA returns HIGH: keep
+ * it short, it is part of the measured tmu_arm latency. */
 typedef void (*ssi_slave_provider_t)(void *ctx, ssi_slave_frame_t *out);
 
 typedef struct {
@@ -49,9 +51,14 @@ typedef struct {
 } ssi_slave_config_t;
 
 typedef struct {
-    uint32_t frames;     /* completed Read Cycles */
-    uint32_t resyncs;    /* frames abandoned mid-message and re-armed */
-    uint32_t period_ns;  /* master clock period measured during the last frame */
+    uint32_t frames;       /* Read Cycles that clocked n bits and the Error Flag */
+    uint32_t short_reads;  /* Read Cycles of exactly n clocks: the master's first
+                            * sample was the idle level, so it reads the frame
+                            * one bit late and never clocks the Error Flag */
+    uint32_t aborted;      /* Read Cycles that stopped before n clocks */
+    uint32_t period_ns;    /* master clock period, from the last full Read Cycle */
+    uint32_t tmu_arm_ns;   /* Tmu overflow -> DATA HIGH on the last Read Cycle;
+                            * taken out of the next one's Tmu */
 } ssi_slave_stats_t;
 
 bool ssi_slave_init(const ssi_slave_config_t *cfg,
@@ -61,7 +68,7 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
  * message out. */
 void ssi_slave_start(void);
 
-/* Parks the transport: stops the clock counter and both DATA DMA streams so
+/* Parks the transport: stops the clock counter, the DATA DMA and Tmu so
  * something else can drive the DATA pin. Call ssi_slave_start() to resume.
  * Needed by the loopback continuity test, which would otherwise race the DMA
  * for the pin it is trying to measure. */
@@ -70,10 +77,6 @@ void ssi_slave_stop(void);
 /* Changes the message length, for switching SSI payload variant. Disarms,
  * reconfigures and re-arms; n_bits must still be a multiple of 8 and <= 32. */
 bool ssi_slave_set_frame_bits(uint8_t n_bits);
-
-/* Recovers from a master that abandoned a Read Cycle part-way through. Call
- * periodically from the main loop; it is a no-op when the link is healthy. */
-void ssi_slave_poll(void);
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out);
 

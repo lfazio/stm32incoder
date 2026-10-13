@@ -162,14 +162,22 @@ static void cmd_stat(void)
                  (unsigned long)st.position, (unsigned)st.timestamp,
                  (unsigned)st.valid, (unsigned)st.zero_default,
                  (unsigned long)st.updates);
-    trace_printf("adc_raw=%u zero_off=%lu frames=%lu resyncs=%lu dropped=%lu\r\n",
+    trace_printf("adc_raw=%u zero_off=%lu dropped=%lu\r\n",
                  (unsigned)position_source_raw_adc(),
                  (unsigned long)incoder_zero_offset(),
-                 (unsigned long)ss.frames, (unsigned long)ss.resyncs,
                  (unsigned long)trace_dropped());
-    trace_printf("data_line_idle_high=%u  measured_T=%luns\r\n",
+    trace_printf("reads: full=%lu short=%lu aborted=%lu\r\n",
+                 (unsigned long)ss.frames, (unsigned long)ss.short_reads,
+                 (unsigned long)ss.aborted);
+    /* The one master bug the slave can see from its side: n clocks instead of
+     * n+1. Such a master reads every frame one bit late, so say so. */
+    if (ss.short_reads != 0u) {
+        trace_printf("  short = master sent n clocks, not n+1 (5.4.1 Trc = nT+T/2):\r\n"
+                     "  it reads the frame shifted one bit, Error Flag never clocked\r\n");
+    }
+    trace_printf("data_line_idle_high=%u  measured_T=%luns  tmu_arm=%luns\r\n",
                  (unsigned)ssi_master_data_idle_high(),
-                 (unsigned long)ss.period_ns);
+                 (unsigned long)ss.period_ns, (unsigned long)ss.tmu_arm_ns);
     /* Names the missing wire rather than leaving a dead link unexplained. */
     trace_printf("clock in PC6: %s\r\n",
                  ssi_slave_clock_counter_ok() ? "counted n"
@@ -186,18 +194,22 @@ static void cmd_read(uint32_t count)
         ssi_variant_t v = incoder_variant();
         uint8_t  n   = ssi_variant_frame_bits(v);
         uint32_t raw = 0;
-        bool ok = ssi_master_read_timer(n, &raw);
+        bool     ef  = false;
+        bool ok = ssi_master_read_timer(n, &raw, &ef);
 
         if (!ok) {
             trace_printf("read %lu: DATA not idle high, aborted\r\n", (unsigned long)i);
         } else {
             ssi_sample_t f;
             ssi_variant_unpack(v, raw, &f);
-            trace_printf("read %lu: raw=%0*lX pv=%u zpd=%u pd=%lu ts=%u %s\r\n",
+            /* PV is the inverse of the Error Flag (5.4.2), so the flag the
+             * (n+1)th clock read has to disagree with PV. */
+            trace_printf("read %lu: raw=%0*lX pv=%u zpd=%u pd=%lu ts=%u ef=%u %s%s\r\n",
                          (unsigned long)i, n / 4, (unsigned long)raw,
                          (unsigned)f.pv, (unsigned)f.zpd,
-                         (unsigned long)f.pd, (unsigned)f.ts,
-                         ssi_variant_check(v, raw) ? "" : "CHECK-FAIL");
+                         (unsigned long)f.pd, (unsigned)f.ts, (unsigned)ef,
+                         ssi_variant_check(v, raw) ? "" : "CHECK-FAIL",
+                         (ef != f.pv) ? "" : " EF-FAIL");
         }
         /* Timg must exceed Tmu (20 us); leave clear margin. */
         ssi_master_delay_us(200);
@@ -232,7 +244,8 @@ static void cmd_burst(uint32_t count, uint32_t gap_us)
     for (uint32_t i = 0; i < count; i++) {
         ssi_variant_t v = incoder_variant();
         uint32_t raw = 0;
-        bool got = ssi_master_read_timer(ssi_variant_frame_bits(v), &raw);
+        bool     ef  = false;
+        bool got = ssi_master_read_timer(ssi_variant_frame_bits(v), &raw, &ef);
         if (i < warmup) {
             ssi_master_delay_us(gap_us);
             continue;
@@ -242,7 +255,7 @@ static void cmd_burst(uint32_t count, uint32_t gap_us)
         } else {
             ssi_sample_t f;
             ssi_variant_unpack(v, raw, &f);
-            if (!ssi_variant_check(v, raw)) {
+            if (!ssi_variant_check(v, raw) || ef == f.pv) {
                 bad++;
                 ssi_master_delay_us(gap_us);
                 continue;

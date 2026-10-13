@@ -61,7 +61,6 @@ int main(void)
 
     for (;;) {
         console_poll();
-        ssi_slave_poll();
 
         uint32_t now = HAL_GetTick();
 

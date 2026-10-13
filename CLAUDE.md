@@ -50,23 +50,35 @@ default (HSE, falling back to HSI).
 
 **There is no SPI anywhere.** The incoming SSI clock drives TIM8 through its
 channel-1 edge detector (TI1F_ED, both edges, ARR=1) on **PC6** (TIM8_CH1 AF3,
-morpho CN10-4), and two compare channels raise DMA requests into
-`GPIOB->BSRR`: CC2 on every rising edge writes the next data bit, CC4 on every
-falling edge writes from a buffer of n zeros then the Error Flag, so the flag
-lands on the last falling edge with no interrupt. Writing 0 to BSRR is a no-op,
-which is what makes that work.
+morpho CN10-4), and two compare channels raise DMA requests:
+
+- **CC2, every rising edge** -> DMA2 S3 writes the next word to `GPIOB->BSRR`.
+  The buffer is **n+1 words**: D(n-1)..D0, then the Error Flag.
+- **CC4, every falling edge** -> DMA2 S7 writes UG into `TIM6->EGR`, restarting
+  the Tmu timer. TIM6 overflowing therefore means "Tmu since the *last* falling
+  edge", whatever the number of clocks, and its handler ends the Read Cycle.
+
+**A Read Cycle is n+1 clock periods, not n.** 5.4.1 gives Trc = n x T + 0.5 x T
+from the first falling edge to the last rising edge, which only fits n+1
+falling and n+1 rising edges: F1 starts the cycle and carries no data, R1..R(n)
+put out D(n-1)..D0, the master samples them on F2..F(n+1), and R(n+1) -- "the
+last rising edge" of note 3 -- puts out the Error Flag. This project assumed n
+for a long time because its own test master sent n, and several conclusions
+below were wrong for that reason alone.
 
 Consequences: DATA changes on the rising edge (+56 ns, DMA latency), nothing
 touches the line between F1 and R1, there is no pin handover and no 250 ns
 deadline, and n need not be a multiple of 8. PB4 is a GPIO output for the whole
 cycle -- only the *writer* changes. **PC6 is the only clock input**; without that
-wire the link is dead and `stat` says `etr=NEVER REACHED n`.
+wire the link is dead and `stat` says `clock in PC6: NEVER REACHED n`.
 
 PB3 and PB5 (the old SPI1 SCK/MOSI) and PD2 (the old TIM3_ETR counter) are no
 longer used at all. SWO trace on PB3 is free again.
 
-The test master is TIM1 compare events + DMA, and it samples **late in the high
-phase, just before the next falling edge** -- where an SSI controller reads. It
+The test master is TIM1 compare events + DMA. It sends **n+1 clocks** and
+samples **late in the high phase, just before the next falling edge** -- where
+an SSI controller reads -- so its samples are D(n-1)..D0 and then the Error
+Flag, which `read` prints as `ef` and `burst` checks against PV. It
 used to sample one tick after the rising edge, which was right when the slave
 drove on the falling edge; after the slave moved, every frame read back shifted
 one bit and `fixed 0x5A5A5` came out as 447186 = `(pd >> 1) | (ZPD << 18)`.
@@ -132,7 +144,8 @@ pack/unpack there and a row in the descriptor table, nothing else.
 SSI6's CRC-8 (polynomial 0x97) cannot use the CRC peripheral: RM0390 4.1/4.2
 give it "a fixed generator polynomial", CRC-32 0x4C11DB7, with no CRC_POL or
 POLYSIZE on this family. It stays in software, in `stage_frame()`, which runs
-after DATA is driven high and so is off both timing-critical paths. Do not leak SSI4
+in the Tmu handler before DATA returns HIGH: off the bit path, but inside the
+self-measured `tmu_arm`. Do not leak SSI4
 field knowledge into it, and do not leak timer/DMA knowledge upward.
 `ssi/ssi_master.c` is a bring-up instrument, not part of the emulated device.
 
@@ -141,10 +154,15 @@ field knowledge into it, and do not leak timer/DMA knowledge upward.
 - Bit shifting is done entirely by the clock and DMA — never add per-bit
   software work. There is no per-frame deadline left, because there is no pin
   handover.
-- End of message is the DATA DMA's transfer-complete, after n transfers. The
-  half-transfer event on the same stream times the clock period; without it the
-  dynamic Tmu correction silently falls back to a fixed 250 ns and Tmu drifts by
-  (T/2 - 250 ns) across the range.
+- The Read Cycle ends when TIM6 overflows: Tmu with no falling edge. Nothing
+  else ends it -- not the DATA DMA's transfer-complete, which now only measures
+  the clock period for `stat`, and not a polled watchdog, which is gone. A
+  master that stops early is recovered by the same overflow.
+- The Tmu handler stages the next frame and re-arms **before** it drives DATA
+  HIGH, so a master that starts the moment it sees HIGH finds the slave ready.
+  That time (3.9 us SSI1, 4.8 us SSI4, 5.0 us SSI6, read off TIM6 itself) is
+  measured every cycle and taken out of the next one's Tmu. `stat` shows it as
+  `tmu_arm`. Anything added to `stage_frame()` or the provider lands there.
 - NVIC priorities are ordered deliberately: the DATA DMA (0,1) and the Tmu timer
   (0,2) outrank the update tick (2,0), trace DMA (3,0) and ADC DMA (3,1).
   Keep tracing off the SSI path — `trace_printf` only fills a ring buffer.
@@ -225,11 +243,14 @@ latch is 10 kHz** (4.12 says "< 0.1 ms", and 5.5.1 pins it by calling ASI2's
 Stamp counter ticks at 100 kHz**, 10 us resolution (5.4.2). 100 kHz is the
 counter, not the latch -- do not "fix" the update rate to 100 kHz.
 
-The Tmu correction is dynamic. Do not replace it with a constant: the
-half-clock-period term ranges from 0.25 us at 2 MHz to 5 us at 100 kHz, and a
-constant tuned at one end puts the other outside the 20 us +/- 1 us window. T is
-measured from the DATA DMA's half-transfer to transfer-complete interval. When
-changing anything in that path, re-tune GAP_ISR_OVERHEAD_NS against a capture.
+Tmu needs no clock-period correction any more: it is timed from the falling
+edge itself, so the half-period term that used to range from 0.25 us at 2 MHz
+to 5 us at 100 kHz is simply not there. Do not reintroduce a timer started from
+the end of the message -- that is what tied Tmu to a guess about where the last
+falling edge was, and it came out one whole period short for every master that
+sends the n+1 clocks the guide asks for. T is still measured (half-transfer to
+transfer-complete of the DATA DMA) but only for `stat`, and only on a Read
+Cycle that reaches n+1 clocks.
 
 Watch integer truncation in that arithmetic: `1000/(SYSCLK_HZ/1000000)` is 5,
 not 5.56, which reported every period 10% short until it was caught against the
@@ -252,21 +273,61 @@ which is the useful signal, since they are the only variants with an integrity
 check and a one-bit shift breaks parity and CRC where it merely relabels a
 position field.
 
-**KNOWN DEVIATION, measured: the Error Flag is 416 ns late** (400..528 over 197
-cycles). The level is right in every cycle at both PV=1 and PV=0, but until the
-store lands the line still carries D0, so on the ~half of cycles where D0=1 the
-gap opens with a spurious HIGH pulse (98/197 at 500 kHz, 95/197 at 2 MHz).
+**The Error Flag is the (n+1)th bit, and that is all it ever was.** It rides
+the DATA DMA as word n and lands on R(n+1), +56 ns like any bit. The history is
+worth keeping because each wrong turn looked reasonable:
 
-Do not try to place the flag with a DMA on a falling-edge compare. It was tried:
-a buffer of n no-ops then the flag, relying on BSRR ignoring a zero word. The
-flag sits at index n and so needs an (n+1)'th falling edge, and a Read Cycle of
-n clock periods has exactly n -- confirmed on the capture, 32 falling edges per
-cycle. It failed silently, the gap holding the stale last data bit, which for a
-`fixed` payload is nearly constant, so a glitch check that only looked for extra
-rising transitions reported a clean 0/197. **The test that catches it is
-comparing the gap level between PV=1 and PV=0**: if the flag is not driven the
-level does not change. It read LOW in 182/197 cycles with PV=0, where it must
-read HIGH.
+- Driven from the end-of-message interrupt it was 416 ns late and, at 500 kHz,
+  destroyed D0 before the master sampled it.
+- Moved to a gap timer at 0.75 T after "the last rising edge" it stopped
+  destroying D0 but took the line ~3 us late.
+- A falling-edge DMA with the flag at buffer index n "could not work" because
+  a Read Cycle "has exactly n falling edges" -- true of this project's test
+  master, false of the guide. Trc = n x T + 0.5 x T is n+1 clocks.
 
-Placing it in hardware needs a timer, not a clock edge, since the last data bit
-is written on the last edge the cycle has. Unresolved.
+The check that catches a flag that is not being driven is still the same:
+**compare the gap level between PV=1 and PV=0** (`err on`). A glitch count
+cannot see it, because a stale last data bit is nearly constant for a `fixed`
+payload.
+
+## What an external master taught that the loopback could not
+
+The first real controller on the link (an SPI master, 562.5 kHz, polling at
+10 kHz) broke three things the loopback had passed, all for one reason: `read`
+and `burst` block the main loop and send n clocks, so nothing that depends on
+either was ever exercised.
+
+- **Anything polled from the main loop runs inside a bit period.** The loop
+  takes a few hundred ns. A watchdog that compared NDTR on consecutive passes
+  re-armed after nearly every bit, and the frame restarted from D(n-1) every
+  three to five bits. Signature on a capture: DATA writes on *falling* edges
+  (re-armed while the clock was LOW) and a TS field that never advances.
+- **Clearing EN on a live memory-to-peripheral DMA stream sets TCIF** (RM0390
+  9.3.14/9.3.15). With TCIE on, every re-arm looked like an end of message.
+  Mask TCIE/HTIE in the same write as EN -- `data_dma_halt()`.
+- **A master that sends n clocks reads every frame one bit late.** Its first
+  sample, at F1 or right at R1, is the idle HIGH; what it decodes is
+  `(1 << (n-1)) | (frame >> 1)`, so SSI4 at position 0 reads back PD = 0x40000
+  (ZPD in the top of the field) and TS counts by 5. That is the master's bug,
+  and a real IncOder would show it too -- do not "fix" it in the emulator.
+  `stat` counts such reads as `short` and says so.
+
+An SPI master on an 8-bit frame cannot send 33 clocks; it sends 40, and that is
+fine: sample on the edge the *slave* sees falling, discard the first bit, take
+the next n, and the one after is the Error Flag. Clocks past n+1 only restart
+Tmu.
+
+Verified on hardware against that master (`stat`, no analyser yet):
+
+- SSI4, master sending 32 = n clocks: every read `short`, at exactly the
+  10 kHz polling rate, `aborted` not moving. A Tmu restart that did not work
+  would leave TIM6 parked and count ~153/s instead.
+- SSI1, same master, 32 clocks >= n+1 = 25: every read `full`, `measured_T`
+  1776 ns against a 1778 ns clock. That exercises the Error Flag word and seven
+  clocks past it.
+
+**Not yet captured on an analyser:** the Error Flag landing on R(n+1), and Tmu
+measured from the last falling edge. The Tmu and Error Flag figures above this
+section were taken on the old two-stage gap with an n-clock test master and say
+nothing about the current path. The loopback jumpers were off for this work, so
+`read`/`burst` with the n+1 test master are untested too.
