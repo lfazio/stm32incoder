@@ -115,8 +115,8 @@ void incoder_update(void)
 
     position_source_tick();
 
-    /* Read the counter first, right as the source is read: the 64-bit scaling
-     * in position_source_read() takes about a microsecond. */
+    /* Read the counter first, right as the source is read:
+     * position_source_read() sorts the ADC window before it returns. */
     const uint16_t now  = incoder_timestamp_now();
     const uint32_t raw  = position_source_read();
     const uint32_t mask = (1u << ssi_variant_position_bits(v)) - 1u;

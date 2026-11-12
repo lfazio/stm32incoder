@@ -54,6 +54,7 @@ add_executable(simenc.elf
     src/ssi/ssi_variant.c
     src/encoder/incoder.c
     src/encoder/position_source.c
+    src/encoder/circular_mean.c
     ${HAL_SOURCES}
 )
 

@@ -263,6 +263,22 @@ stamping that dated every position ~5 ticks late. `fixed`/`ramp` have no window
 and return 0. If the ADC timing or ADC_AVG_SAMPLES changes, the macros in
 position_source.c recompute it.
 
+The ADC window is averaged **on the circle** (`encoder/circular_mean.c`, pure,
+host-testable): 0 V and VDDA are one angle, and an arithmetic mean of a window
+straddling them is half a turn off. Do not go back to a plain sum, and do not
+unwrap around one sample or sample-to-sample -- the first fails once a window
+spans half a turn (the 6.1 kHz sawtooth spans 2321 codes), the second needs
+the ring's order and is thrown a whole turn by one retrace sample. The scale
+is **2^bits / 4096 per code** (DS10693 Figure 45: LSB = VREF+/4096, code k
+centred on k LSB), so code 4095 is 524160 and VDDA is a full turn. Do not
+"fix" full scale to 524287; that was a 4096/4095 gain error.
+
+Verified on hardware by freezing the window -- clear ADON in ADC1 CR2
+(`0x40012008`), read `s_samples`, compare `stat` with the host computation,
+set ADON then SWSTART -- three windows exact, two of them across zero, where
+the old code would have said 264469 instead of 2261. Freezing this way does
+not overrun the ADC, so `adc_ovr` stays put.
+
 PV for the ADC source is `s_adc_filled && !ADC_SR_OVR`. A conversion counter
 compared against 12 wrapped every ~10.2 h (2^32/12 x 102.4 us) and dropped PV
 for one window. An overrun freezes the DMA window on its last values, and

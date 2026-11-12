@@ -135,7 +135,7 @@ and three about the update path:
 | | Default |
 |---|---|
 | System clock | HSE if the ST-LINK MCO is strapped, else HSI — the banner says which, and flags `[timestamp OUT OF SPEC]` on the HSI fallback |
-| Position source | `adc` — PA0, 0…VDDA mapped to 0…524287 counts |
+| Position source | `adc` — PA0, 0…VDDA mapped onto one turn (128 counts per ADC code; VDDA ≡ 0) |
 | Zero point | factory, so ZPD = 1 |
 | PV | 1 (`err off`) |
 | SSI payload variant | **SSI4** — n = 32 bits, 19-bit position, 10 µs Time Stamp |
@@ -311,6 +311,19 @@ measured, and a 400 µs smear makes that claim false.
 The ADC now free-runs and each update averages the 12 conversions taken during
 that period (12 × 8.53 µs = 102 µs against the 100 µs period), which is both
 genuinely per-period and worth about 1.8 bits of noise averaging.
+
+**The 12 conversions are averaged on the circle.** 0 V and VDDA are the same
+angle, so an arithmetic mean of a window that straddles them lands half a turn
+away: 4000 and 100 average to 2050. `circular_mean.c` sorts the window, cuts
+the circle at the widest gap between samples, lifts the samples before the
+cut by one turn and sums. That is exact for any steady rotation under
+4096 / 12 = 341 codes per conversion, whatever order the DMA left the samples
+in. A 40 ms capture of PA0, a 6.1 kHz sawtooth that wraps every 164 µs, put
+62% of the windows across zero; the arithmetic mean was exact on 43% of them
+and up to half a turn off, while the circular mean matched an independent
+unwrap on every window that holds no retrace sample. A sample caught on the
+generator's retrace still pulls its windows by up to ~170 codes, but no longer
+by half a turn.
 
 **TS marks the middle of that window, not its end.** An average of 12
 conversions is the position at the window's centroid. The update tick comes
@@ -712,10 +725,16 @@ requests land on DMA2. No SPI is involved anywhere, at either end of the link.
 
   Scale a 5 V source with a divider instead, keeping the source impedance under
   the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives 5 V → 3.31 V at ~3.4 kΩ.
-- **Analog → angle mapping.** 0 V…VDDA maps linearly onto the full position
-  field — 0…524287 counts for SSI4's 19 bits, 0…4194303 for the 22-bit
-  variants, both endpoints exact. The oversampled *sum* is what gets scaled,
-  not the 12-bit average, so the averaging gain is not thrown away first.
+- **Analog → angle mapping.** 0 V…VDDA maps linearly onto one turn: code k is
+  k × 2^(bits−12) counts, 128 for SSI4's 19 bits and 1024 for the 22-bit
+  variants. DS10693 Figure 45 gives 1 LSB = VREF+/4096 with the ideal
+  transitions at 0.5, 1.5 … 4094.5 LSB, so code k is centred on k/4096 of full
+  scale, and VDDA is code 4096: a whole turn, the same angle as 0 V. Code 4095
+  is therefore 524160, not 524287 — the counts above it are inside its bin. An
+  earlier (2^bits−1)/4095 scale reached 524287 at the cost of a 4096/4095 gain
+  error and a 1-count step across zero. The oversampled *sum* is what gets
+  scaled, not the 12-bit average, so the averaging gain is not thrown away
+  first.
 
   That spans the IncOder's numeric range but does not manufacture its
   precision: the source is a 12-bit ADC, and averaging 12 samples is worth

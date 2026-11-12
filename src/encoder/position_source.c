@@ -1,5 +1,6 @@
 #include "encoder/position_source.h"
 #include "board/board.h"
+#include "encoder/circular_mean.h"
 #include "ssi/ssi_variant.h"
 
 /* The IncOder specifies an "Internal Position Update Period" of < 0.1 ms for
@@ -207,21 +208,25 @@ void position_source_set_ramp_step(int32_t counts_per_update)
     s_ramp_step = counts_per_update;
 }
 
-/* Sum of the averaging window, 0 .. ADC_AVG_SAMPLES * 4095.
+/* Sum of the averaging window taken on the circle (circular_mean.h): divided by
+ * ADC_AVG_SAMPLES it is the window's circular mean in ADC codes, modulo one
+ * turn, somewhere in 0 .. 2 turns.
  *
  * Kept un-divided on purpose. Dividing down to 12 bits first throws away
  * whatever the oversampling bought, and it is the sum that gets scaled into
- * the position field. */
+ * the position field.
+ *
+ * A copy, because circular_sum() sorts its input and the DMA keeps writing.
+ * A slot replaced during the copy only trades the oldest conversion for a
+ * newer one, and the order of the samples does not matter. */
 static uint32_t adc_sum(void)
 {
-    uint32_t sum = 0;
+    uint16_t v[ADC_AVG_SAMPLES];
     for (uint32_t i = 0; i < ADC_AVG_SAMPLES; i++) {
-        sum += s_samples[i];
+        v[i] = s_samples[i];
     }
-    return sum;
+    return circular_sum(v, ADC_AVG_SAMPLES);
 }
-
-#define ADC_SUM_FULL_SCALE  (ADC_AVG_SAMPLES * 4095u)
 
 uint32_t position_source_delay_us(void)
 {
@@ -235,7 +240,8 @@ uint32_t position_source_delay_us(void)
 
 uint16_t position_source_raw_adc(void)
 {
-    return (uint16_t)(adc_sum() / ADC_AVG_SAMPLES);
+    return (uint16_t)(((adc_sum() + ADC_AVG_SAMPLES / 2u) / ADC_AVG_SAMPLES)
+                      % CIRCULAR_TURN);
 }
 
 void position_source_tick(void)
@@ -254,34 +260,36 @@ uint32_t position_source_read(void)
         return s_ramp;
     case POS_SRC_ADC:
     default: {
-        /* Scale the acquisition across the whole position field.
+        /* Scale the circular mean onto the position field.
          *
-         * This used to be `avg12 << (bits - 12)`, which has two faults. Full
-         * scale landed on 524160 rather than 524287, so the top 127 counts
-         * were unreachable and the transfer function had a gain error of one
-         * ADC LSB; and the low bits were always zero, because the sum had
-         * already been divided back down to 12 bits.
+         * 1 LSB is VREF+/4096, and on the ideal transfer curve the
+         * transitions sit at 0.5, 1.5, ... 4094.5 LSB [DS10693 Rev 11
+         * Figure 45], so code k is centred on k/4096 of full scale. The
+         * position field is one turn of 2^bits counts, and incoder.c works
+         * modulo that. Code k is therefore k * 2^(bits - 12) counts, exactly,
+         * and VREF+ is a whole turn: the same angle as 0 V.
          *
-         * Scaling the *sum* fixes both: 0 maps to 0 and full scale maps to
-         * exactly s_pos_mask, for any position width, and the quantisation
-         * step is the sum's, not the average's.
+         * This was (2^bits - 1) / 4095 per code for a while, so that code
+         * 4095 would land on 2^bits - 1. That is a gain of 4096/4095: +127
+         * counts at the top of a 19-bit field, and a step of 1 count instead
+         * of 128 from code 4095 across zero. The 127 counts above code 4095
+         * are not unreachable by mistake; they are inside its bin.
          *
-         * Be clear about what this is and is not. It makes the emulator use
-         * the IncOder's full 19-bit (or 22-bit) numeric range, which is what
-         * a controller expects to see. It does not create 19 bits of real
-         * measurement: the source is a 12-bit ADC, and averaging 12 samples
-         * is worth about 1.8 bits more (sqrt(12)) and only when the input
-         * carries enough noise to dither. Reaching 19 honest bits would need
-         * 4^7 = 16384 samples per update, which does not fit a 100 us period.
+         * Scaling the sum rather than the average keeps the oversampling: the
+         * step is 2^(bits - 12) / 12, 10.7 counts at 19 bits. That fills the
+         * IncOder's numeric range, which is what a controller expects, but it
+         * is not 19 bits of measurement: the source is a 12-bit ADC, and
+         * averaging 12 samples is worth about 1.8 bits more (sqrt(12)) and
+         * only when the input carries enough noise to dither. Reaching 19
+         * honest bits would need 4^7 = 16384 samples per update, which does
+         * not fit a 100 us period.
          *
-         * 64-bit because the product overflows 32: 49140 * 524287 = 2.6e10.
-         * This runs in the 10 kHz update tick, not on the SSI path. */
-        uint32_t sum = adc_sum();
-        if (sum > ADC_SUM_FULL_SCALE) {
-            sum = ADC_SUM_FULL_SCALE;       /* cannot happen; cheap guard */
-        }
-        return (uint32_t)(((uint64_t)sum * (uint64_t)s_pos_mask)
-                          / (uint64_t)ADC_SUM_FULL_SCALE);
+         * Rounded to nearest. The mask folds the circular mean, which can sit
+         * up to two turns up, back into one turn. 32 bits are enough: the sum
+         * is under 2 * 4096 * 12 < 2^17, and shifted by at most 10. */
+        const uint32_t sum = adc_sum();
+        return (((sum << (s_pos_bits - 12u)) + ADC_AVG_SAMPLES / 2u)
+                / ADC_AVG_SAMPLES) & s_pos_mask;
     }
     }
 }

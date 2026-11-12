@@ -6,9 +6,13 @@
  *
  * Mapping of the analog input to position is a choice of this emulator, not a
  * value from the IncOder specification: the full ADC span (0 V .. VDDA) maps
- * linearly onto the full 19-bit position range, i.e. 0 V = 0 counts = 0 deg
- * and VDDA = 524287 counts ~ 360 deg. The ADC is 12-bit, so an analog-driven
- * position moves in steps of 128 counts even though the SSI4 field is 19-bit.
+ * linearly onto one turn, i.e. 0 V = 0 counts = 0 deg and VDDA = 2^19 counts
+ * = 360 deg, the same angle as 0 V. One ADC code is 128 counts of the 19-bit
+ * SSI4 field; the 12-sample average refines that to 10.7.
+ *
+ * Because 0 V and VDDA are one angle, the average is taken on the circle
+ * (circular_mean.h): an input ramp that wraps from one end of the ADC span to
+ * the other reads as continuous rotation.
  */
 #ifndef SIMENC_POSITION_SOURCE_H
 #define SIMENC_POSITION_SOURCE_H
@@ -17,7 +21,7 @@
 #include <stdint.h>
 
 typedef enum {
-    POS_SRC_ADC = 0,  /* PA0 / A0, free-running, DMA fed, 12x averaged */
+    POS_SRC_ADC = 0,  /* PA0 / A0, free-running, DMA fed, 12x circular mean */
     POS_SRC_FIXED,    /* constant value, set from the console */
     POS_SRC_RAMP,     /* free-running sweep, for loopback tests */
 } position_source_t;
@@ -42,7 +46,7 @@ const char       *position_source_name(position_source_t src);
 void position_source_set_fixed(uint32_t counts);
 void position_source_set_ramp_step(int32_t counts_per_update);
 
-/* Raw last ADC sample, for tracing. */
+/* Circular mean of the ADC averaging window in codes, 0..4095, for tracing. */
 uint16_t position_source_raw_adc(void);
 
 /* Current 19-bit position, already clamped to the SSI4 field width. */
