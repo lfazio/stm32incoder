@@ -163,6 +163,19 @@ field knowledge into it, and do not leak timer/DMA knowledge upward.
   That time (3.9 us SSI1, 4.8 us SSI4, 5.0 us SSI6, read off TIM6 itself) is
   measured every cycle and taken out of the next one's Tmu. `stat` shows it as
   `tmu_arm`. Anything added to `stage_frame()` or the provider lands there.
+- The update tick also rebuilds the armed frame after every latch
+  (`incoder_update()` -> `ssi_slave_refresh()`), but only while TIM8 CC4IF is
+  clear, i.e. before F1. It builds into a shadow first, then tests and copies
+  under PRIMASK (1.3 us for 33 words). The copy is safe against an F1 right
+  after the test because it outruns the DMA. Without the refresh a frame was as
+  old as the master's idle time: the first read after reset said PV=0 and
+  `burst` needed warm-up cycles. Do not use TIM8 CNT as the idle test -- it
+  returns to 0 on every rising edge. The provider now runs from both handlers,
+  so keep it reentrant.
+- The latched sample is double-buffered (`s_sample[2]` + `s_cur` in
+  incoder.c). The Tmu handler preempts the tick, so separate variables let it
+  pack a new TS with the previous update's PD/PV. Never go back to writing the
+  fields one by one.
 - NVIC priorities are ordered deliberately: the DATA DMA (0,1) and the Tmu timer
   (0,2) outrank the update tick (2,0), trace DMA (3,0) and ADC DMA (3,1).
   Keep tracing off the SSI path — `trace_printf` only fills a ring buffer.
@@ -242,6 +255,19 @@ latch is 10 kHz** (4.12 says "< 0.1 ms", and 5.5.1 pins it by calling ASI2's
 10 kHz "the same rate as Internal Position Update Period"), while the **Time
 Stamp counter ticks at 100 kHz**, 10 us resolution (5.4.2). 100 kHz is the
 counter, not the latch -- do not "fix" the update rate to 100 kHz.
+
+TS is set back to the **centroid of the ADC averaging window**:
+`position_source_delay_us()` = 12/2 x 8.533 + 1.067 = 52 us, which is 5 ticks
+for SSI4 and 52 for SSI9. The tick comes at the *end* of the window, and
+stamping that dated every position ~5 ticks late. `fixed`/`ramp` have no window
+and return 0. If the ADC timing or ADC_AVG_SAMPLES changes, the macros in
+position_source.c recompute it.
+
+PV for the ADC source is `s_adc_filled && !ADC_SR_OVR`. A conversion counter
+compared against 12 wrapped every ~10.2 h (2^32/12 x 102.4 us) and dropped PV
+for one window. An overrun freezes the DMA window on its last values, and
+nothing caught it until `position_source_service()` (main loop) restarted the
+ADC.
 
 Tmu needs no clock-period correction any more: it is timed from the falling
 edge itself, so the half-period term that used to range from 0.25 us at 2 MHz
@@ -331,3 +357,12 @@ measured from the last falling edge. The Tmu and Error Flag figures above this
 section were taken on the old two-stage gap with an n-clock test master and say
 nothing about the current path. The loopback jumpers were off for this work, so
 `read`/`burst` with the n+1 test master are untested too.
+
+**Not yet run on hardware at all:** the idle-frame refresh, the double-buffered
+sample, the TS centroid offset and the ADC overrun recovery. Their checks are:
+- `read 1` 5 s after reset must say `pv=1`.
+- `fixed X` then `read 1` must give X on Read Cycle 0.
+- With `src ramp`, every pair of consecutive frames on a capture must satisfy
+  `dPD == step x dTS/10`.
+- Clearing EN on DMA2 S0 (`0x40026410`) must show `pv=0`, then `adc_ovr=1`,
+  then `pv=1` again.

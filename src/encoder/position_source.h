@@ -17,7 +17,7 @@
 #include <stdint.h>
 
 typedef enum {
-    POS_SRC_ADC = 0,  /* PA0 / A0, timer-triggered, DMA fed */
+    POS_SRC_ADC = 0,  /* PA0 / A0, free-running, DMA fed, 12x averaged */
     POS_SRC_FIXED,    /* constant value, set from the console */
     POS_SRC_RAMP,     /* free-running sweep, for loopback tests */
 } position_source_t;
@@ -29,8 +29,8 @@ void position_source_init(void);
  * so full scale still means a full revolution. */
 void position_source_set_width(uint8_t bits);
 
-/* Starts the ADC + trigger timer. Safe to call even when another source is
- * selected; the conversions simply go unused. */
+/* Starts the ADC and the update-tick timer. Safe to call even when another
+ * source is selected; the conversions simply go unused. */
 void position_source_start(void);
 
 void              position_source_select(position_source_t src);
@@ -48,9 +48,20 @@ uint16_t position_source_raw_adc(void);
 /* Current 19-bit position, already clamped to the SSI4 field width. */
 uint32_t position_source_read(void);
 
-/* True when the selected source has produced at least one usable value. This
- * drives the PV (Position Valid) flag. */
+/* True when the selected source has produced at least one usable value and
+ * is still producing them (no ADC overrun). This drives the PV (Position
+ * Valid) flag. */
 bool position_source_valid(void);
+
+/* How long before the update tick the value returned by
+ * position_source_read() was measured, in microseconds: the centroid of the
+ * ADC averaging window (~52 us), 0 for the synthetic sources. The Time Stamp is
+ * set back by this much. */
+uint32_t position_source_delay_us(void);
+
+/* Restarts the ADC after an overrun. Call from the main loop. */
+void     position_source_service(void);
+uint32_t position_source_overruns(void);
 
 /* Advances time-dependent sources. Called from the position update tick. */
 void position_source_tick(void);

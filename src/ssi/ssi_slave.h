@@ -41,8 +41,10 @@ typedef struct {
 } ssi_slave_frame_t;
 
 /* Called to fetch the frame that the next Read Cycle will transmit.
- * Runs in interrupt context at the end of Tmu, before DATA returns HIGH: keep
- * it short, it is part of the measured tmu_arm latency. */
+ * Runs in interrupt context: at the end of Tmu, before DATA returns HIGH, where
+ * it is part of the measured tmu_arm latency, and from ssi_slave_refresh() in
+ * the update tick, which the Tmu handler can preempt. Keep it short and
+ * reentrant. */
 typedef void (*ssi_slave_provider_t)(void *ctx, ssi_slave_frame_t *out);
 
 typedef struct {
@@ -59,6 +61,8 @@ typedef struct {
     uint32_t period_ns;    /* master clock period, from the last full Read Cycle */
     uint32_t tmu_arm_ns;   /* Tmu overflow -> DATA HIGH on the last Read Cycle;
                             * taken out of the next one's Tmu */
+    uint32_t refreshed;       /* idle frames rebuilt by ssi_slave_refresh() */
+    uint32_t refresh_skipped; /* refreshes refused: a Read Cycle had begun */
 } ssi_slave_stats_t;
 
 bool ssi_slave_init(const ssi_slave_config_t *cfg,
@@ -77,6 +81,14 @@ void ssi_slave_stop(void);
 /* Changes the message length, for switching SSI payload variant. Disarms,
  * reconfigures and re-arms; n_bits must still be a multiple of 8 and <= 32. */
 bool ssi_slave_set_frame_bits(uint8_t n_bits);
+
+/* Rebuilds the armed frame from the provider when no Read Cycle has begun, so
+ * a new measurement reaches the line at once instead of after the next Read
+ * Cycle. Call it after each internal position update; it does nothing once
+ * the first falling edge has arrived, and the Tmu handler stages the latest
+ * sample at the end of that Read Cycle anyway. Interrupt-safe; masks
+ * interrupts for the copy only (1.3 us for 33 words). */
+void ssi_slave_refresh(void);
 
 void ssi_slave_get_stats(ssi_slave_stats_t *out);
 

@@ -54,6 +54,14 @@ static volatile uint32_t     s_short;          /* exactly n clocks */
 static volatile uint32_t     s_aborted;        /* fewer than n */
 static volatile uint32_t     s_tmu_arm_ticks;  /* last overflow -> DATA HIGH */
 
+/* Idle-frame refresh, see ssi_slave_refresh(). s_arm_gen moves on every
+ * ssi_arm(), so a refresh built against one arm is never copied into the
+ * buffer of the next. s_running is false while the transport is parked. */
+static volatile uint32_t     s_arm_gen;
+static volatile bool         s_running;
+static volatile uint32_t     s_refreshed;      /* idle frame rebuilt from a new sample */
+static volatile uint32_t     s_refresh_skipped;/* Read Cycle already under way */
+
 /* Sticky: the counter has actually reached n and ended a message. Set from the
  * end-of-Read-Cycle handler, which is the only thing that proves it -- an
  * earlier version polled CNT != 0 instead and was wrong in both directions. It
@@ -96,7 +104,8 @@ static inline uint32_t bsrr_word(bool level)
 
 /* --- frame staging -------------------------------------------------------- */
 
-static void stage_frame(void)
+/* Fetches a frame from the provider and expands it into n+1 BSRR words. */
+static void build_frame(volatile uint32_t *buf, uint8_t n_bits)
 {
     ssi_slave_frame_t f = { .payload = 0, .error_flag = false };
 
@@ -108,8 +117,8 @@ static void stage_frame(void)
      * a single store with no read-modify-write, so the DMA needs no knowledge
      * of any other pin in the port -- which is the register-sharing trap that
      * bit us in EXTI3_IRQHandler, avoided here by construction. */
-    for (uint8_t i = 0; i < s_cfg.n_bits; i++) {
-        s_bsrr[i] = bsrr_word(((f.payload >> (s_cfg.n_bits - 1u - i)) & 1u) != 0u);
+    for (uint8_t i = 0; i < n_bits; i++) {
+        buf[i] = bsrr_word(((f.payload >> (n_bits - 1u - i)) & 1u) != 0u);
     }
 
     /* The Error Flag is simply bit n+1.
@@ -124,7 +133,14 @@ static void stage_frame(void)
      *
      * PV is the inverse of the ERROR FLAG, so a valid measurement drives DATA
      * LOW for the rest of Tmu. */
-    s_bsrr[s_cfg.n_bits] = bsrr_word(f.error_flag);
+    buf[n_bits] = bsrr_word(f.error_flag);
+}
+
+/* Only ever called while the DATA DMA is idle: from the Tmu handler before
+ * ssi_arm(), and from ssi_slave_start(). */
+static void stage_frame(void)
+{
+    build_frame(s_bsrr, s_cfg.n_bits);
 }
 
 /* --- arming --------------------------------------------------------------- */
@@ -174,6 +190,8 @@ static void ssi_arm(void)
     CLK_TIM->SR    = 0;
     CLK_TIM->DIER |= TIM_DIER_CC2DE | TIM_DIER_CC4DE;
     CLK_TIM->CR1  |= TIM_CR1_CEN;
+
+    s_arm_gen++;
 }
 
 /* Park the Tmu timer between Read Cycles.
@@ -449,6 +467,8 @@ bool ssi_slave_init(const ssi_slave_config_t *cfg,
     s_frames   = 0;
     s_short    = 0;
     s_aborted  = 0;
+    s_refreshed       = 0;
+    s_refresh_skipped = 0;
 
     /* Cycle counter, used to measure the master's clock period. */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -470,6 +490,7 @@ void ssi_slave_stop(void)
      * the clock reaches PC6 -- so without this, TIM8 counts those edges and the
      * DATA DMA writes PB4 from under the test, which reports the wire OPEN when
      * it is fine. */
+    s_running = false;      /* first: no refresh may touch the buffer from here */
     CLK_TIM->CR1  &= ~TIM_CR1_CEN;
     CLK_TIM->DIER  = 0;
     CLK_TIM->SR    = 0;
@@ -489,6 +510,60 @@ void ssi_slave_start(void)
     TMU_TIM->SR   = 0;
     TMU_TIM->CR1 |= TIM_CR1_CEN;
     data_drive(true);
+    s_running = true;
+}
+
+/* Rebuild the armed frame from the latest sample, if no Read Cycle has begun.
+ *
+ * Without this a new measurement reached the line only at the end of the
+ * *next* Read Cycle's Tmu, so the frame a master read carried the sample that
+ * was current when its *previous* read ended: as old as the master's idle
+ * time, without bound. The first read after reset reported PV=0 however long
+ * the board had been up, and `burst` needed warm-up cycles to see a `fixed`
+ * value. The Tmu handler still stages at the end of every Read Cycle (5.4.1
+ * note 4); this keeps the idle frame current in between.
+ *
+ * The frame is built into a shadow outside the critical section, so that the
+ * provider's cost -- a CRC for SSI6 -- never runs with interrupts masked. Only
+ * the test and the copy are atomic: about 7 cycles a word, 1.3 us for SSI4.
+ *
+ * Why the copy cannot be torn by a master that starts right after the test:
+ *  - TIM8 CC4IF is the "a Read Cycle has begun" flag. ssi_arm() clears SR, and
+ *    the only thing that sets CC4IF afterwards is the counter stepping 0 -> 1,
+ *    which is F1. CNT cannot serve: it returns to 0 on every rising edge.
+ *  - If F1 lands just after the test, the DMA reads word k on R(k+1), at least
+ *    T/2 + k*T after F1 -- 250 + 500k ns at 2 MHz, the fastest clock 5.4.1
+ *    allows. The copy writes word k about 40k ns after the test, word 0
+ *    first, with interrupts masked so nothing can stall it. It stays ahead.
+ *  - A Tmu overflow that ends a real Read Cycle cannot fall inside the
+ *    critical section, because the copy only happens when no edge has come.
+ *    Only the parked overflow can be delayed, and it does nothing.
+ * The generation and n_bits checks reject a shadow built before a re-arm or a
+ * variant change. */
+void ssi_slave_refresh(void)
+{
+    const uint32_t gen = s_arm_gen;
+    const uint8_t  n   = s_cfg.n_bits;
+    uint32_t       shadow[SSI_MAX_BITS + 1u];
+
+    if (!s_running) {
+        return;
+    }
+
+    build_frame(shadow, n);
+
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_running && gen == s_arm_gen && n == s_cfg.n_bits &&
+        (CLK_TIM->SR & TIM_SR_CC4IF) == 0u) {
+        for (uint32_t i = 0; i <= n; i++) {
+            s_bsrr[i] = shadow[i];
+        }
+        s_refreshed++;
+    } else {
+        s_refresh_skipped++;
+    }
+    __set_PRIMASK(primask);
 }
 
 bool ssi_slave_set_frame_bits(uint8_t n_bits)
@@ -512,6 +587,8 @@ void ssi_slave_get_stats(ssi_slave_stats_t *out)
     out->aborted     = s_aborted;
     out->period_ns   = s_period_valid ? s_period_ns : 0u;
     out->tmu_arm_ns  = s_tmu_arm_ticks * TMU_TICK_NS;
+    out->refreshed       = s_refreshed;
+    out->refresh_skipped = s_refresh_skipped;
 }
 
 bool ssi_slave_clock_counter_ok(void)

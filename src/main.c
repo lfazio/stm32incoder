@@ -16,8 +16,9 @@
 #include "ssi/ssi_master.h"
 #include "ssi/ssi_slave.h"
 
-/* Internal position update tick: TIM2 update, 100 us. The same event triggers
- * the ADC in hardware, so the conversion and this latch stay in step. */
+/* Internal position update tick: TIM2 update, 100 us. The ADC free-runs on
+ * its own and this tick averages whatever the DMA has written; the latched
+ * sample is then put on the line at once if the link is idle. */
 void TIM2_IRQHandler(void)
 {
     if (TIM2->SR & TIM_SR_UIF) {
@@ -61,6 +62,7 @@ int main(void)
 
     for (;;) {
         console_poll();
+        position_source_service();
 
         uint32_t now = HAL_GetTick();
 

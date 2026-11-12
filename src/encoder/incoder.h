@@ -9,7 +9,12 @@
  *     position every 100 us.
  *   - The Time Stamp field records the counter value at the moment the
  *     position was measured (5.4.2), so position and timestamp are latched
- *     together by the update tick, not when the frame is transmitted.
+ *     together by the update tick, not when the frame is transmitted. For the
+ *     ADC source that moment is the middle of the averaging window, about
+ *     52 us before the tick, and TS is set back by that much.
+ *   - Each update is put on the line at once if no Read Cycle has begun, so a
+ *     master reads a measurement at most one update period old, however long
+ *     it left the link idle.
  *   - Zero Point: as supplied the zero point is the factory setting, which is
  *     what ZPD reports (5.2).
  */
@@ -37,8 +42,9 @@ void incoder_init(void);
 bool          incoder_set_variant(ssi_variant_t v);
 ssi_variant_t incoder_variant(void);
 
-/* Latches a new position together with its timestamp. Called from the 100 us
- * update tick. */
+/* Latches a new position together with its timestamp, then refreshes the
+ * armed frame (ssi_slave_refresh). Called from the 100 us update tick, and
+ * from nowhere else: it is the only writer of the latched sample. */
 void incoder_update(void);
 
 void incoder_get_state(incoder_state_t *out);

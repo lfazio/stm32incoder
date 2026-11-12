@@ -121,6 +121,15 @@ DATA is idle high, and three things about the master:
 - `tmu_arm` — how long staging and re-arming took at the end of the last Tmu.
   It is measured every cycle and taken out of the next one.
 
+and three about the update path:
+
+- `refresh= skipped=` — update ticks that rebuilt the idle frame, and ticks
+  that found a Read Cycle already under way and left it alone. With a master
+  polling at 10 kHz, expect `skipped` to be roughly (Trc + Tmu) / 100 µs of
+  the total.
+- `adc_ovr=` — ADC overruns recovered. Each one drops PV until the averaging
+  window has refilled.
+
 ### State at power-on
 
 | | Default |
@@ -277,7 +286,8 @@ Verified against the slave's own independent period measurement:
 | 100 kHz | 100 000 Hz | 10006 ns |
 
 Every rate programmed exactly (+0.0 %), and `burst 40` decoded `ok=38 bad=0` at
-each — `burst` skips two warm-up cycles, so it reports `n-2`. The power-on
+each — `burst` skipped two warm-up cycles then, so it reported `n-2`; it no
+longer skips any. The power-on
 default is **500 kHz**.
 
 
@@ -302,14 +312,31 @@ The ADC now free-runs and each update averages the 12 conversions taken during
 that period (12 × 8.53 µs = 102 µs against the 100 µs period), which is both
 genuinely per-period and worth about 1.8 bits of noise averaging.
 
-### One-cycle data latency is intentional
+**TS marks the middle of that window, not its end.** An average of 12
+conversions is the position at the window's centroid. The update tick comes
+6 × 8.53 µs + 1.07 µs ≈ 52 µs later on average: half the window, the hold-to-end
+time of a conversion, and the mean age of the last conversion, since the ADC
+free-runs against the tick. Stamping the tick time would date every position
+~5 TS ticks late, about 3° at 10 000 rpm. TS is therefore set back by the
+source's delay, rounded to the variant's tick: 5 ticks for SSI4, 52 for SSI9.
+The residual is ±4.3 µs, which is below SSI4's 10 µs resolution but not below
+SSI9's 1 µs. `fixed` and `ramp` have no window and are not set back.
 
-A value changed between Read Cycles appears in the *next* frame, not the current
-one: the payload is staged at the end of Tmu, matching "after Tmu, the latest
-position data is now available for transmission in the next Read Cycle"
-(5.4.1 note 4). A real encoder latches its data the same way.
+**PV follows the ADC, not just its start-up.** It is 0 until the first window
+has filled, and again after an ADC overrun, which in DMA mode freezes the
+window on its last values. The main loop restarts the ADC and PV returns once
+a fresh window has filled. An earlier version counted conversions instead. The
+count wrapped every ~10 h and dropped PV for one window each time.
 
-Measured, changing `fixed` and reading immediately each time:
+### Data latency: at most one update period
+
+The payload used to be staged only at the end of Tmu ("after Tmu, the latest
+position data is now available for transmission in the next Read Cycle",
+5.4.1 note 4). A measurement taken after that point therefore reached the line
+only at the end of the *next* Read Cycle. A frame was as old as the master's
+idle time, without bound. The first read after reset reported PV=0 however
+long the board had been up, and a value changed between Read Cycles appeared
+one cycle late:
 
 | after | Read Cycle 0 | Read Cycles 1+ |
 |---|---|---|
@@ -317,10 +344,24 @@ Measured, changing `fixed` and reading immediately each time:
 | `fixed 0x5A5A5` | 74565 *(previous)* | **370085** |
 | `fixed 0x2AAAA` | 370085 *(previous)* | **174762** |
 
-Exactly one cycle, and every stale frame is well formed — `pv=1`, `zpd=1`,
-correct structure. `burst` skips two warm-up cycles rather than one: only one is
-needed for the staging itself, the second is margin against a console command
-landing mid-cycle.
+Now the update tick also rebuilds the armed frame each time it latches a new
+sample, as long as no Read Cycle has begun (`ssi_slave_refresh()`). The Tmu
+handler still stages at the end of each Read Cycle, so note 4 holds; the
+refresh only keeps that frame the latest one while the link is idle. A master
+therefore reads a measurement at most one update period (~100 µs) old,
+whatever its polling rate. That makes `burst`'s warm-up cycles unnecessary,
+and they are gone.
+
+The refresh never tears a frame. It builds the new frame into a shadow buffer,
+then, with interrupts masked, copies it over the armed one only if TIM8's
+CC4IF is still clear — that flag is set by the first falling edge and nothing
+else. If F1 arrives just after the test, the copy (≈40 ns a word, word 0 first)
+outruns the DMA, which cannot read word k before T/2 + k·T. The masked span is
+1.3 µs for SSI4, and it only ever happens on an idle link, so it cannot delay
+the Tmu overflow that ends a real Read Cycle.
+
+*Not yet re-measured on hardware:* the table above is from before the change;
+Read Cycle 0 is now expected to carry the new value.
 
 ### Stage 2 — RS-422 through two MAX490
 
@@ -642,7 +683,7 @@ Position and timestamp are latched **together** by the 100 µs update tick, so
 | **TIM8** | **clocked by the SSI clock on PC6 (TI1F_ED, both edges, ARR=1); the CH2 compare shifts each bit and the Error Flag, the CH4 compare restarts Tmu** | **CH2→DMA2 S3 C7 → `GPIOB->BSRR`; CH4→DMA2 S7 C7 → `TIM6->EGR`** |
 | TIM6 | Tmu since the last falling edge, 0.1 µs tick; reset by DMA, never by an interrupt | written by DMA2 S7 |
 | TIM7 | Time Stamp counter, 10 µs tick, wraps 2048 | — |
-| TIM2 | 10 kHz update tick + ADC trigger (TRGO) | — |
+| TIM2 | 10 kHz update tick (the ADC free-runs, untriggered) | — |
 | ADC1 IN0 | angle acquisition | DMA2 S0 C0, circular |
 | USART2 | trace/console | TX DMA1 S6 C4 |
 | **TIM1** | **test-master clock, any 180 MHz / N** | **CH1→DMA2 S1 C6 (clock low), CH3→S6 C6 (clock high), CH4→S4 C6 (sample IDR)** |

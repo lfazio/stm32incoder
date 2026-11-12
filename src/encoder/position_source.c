@@ -28,6 +28,32 @@
  * re-checking the bit timing on an analyser. */
 #define ADC_AVG_SAMPLES  12u
 
+/* The conversion timing above, as the code configures it in adc_init(). Keep
+ * these in step with ADC_CLOCK_SYNC_PCLK_DIV8 and ADC_SAMPLETIME_84CYCLES. */
+#define ADC_CLOCK_DIV       8u
+#define ADC_SAMPLE_CYCLES   84u
+#define ADC_CONVERT_CYCLES  12u   /* 12-bit successive approximation */
+#define ADC_CONV_NS  ((uint32_t)(((uint64_t)(ADC_SAMPLE_CYCLES + ADC_CONVERT_CYCLES) \
+                                  * ADC_CLOCK_DIV * 1000000000ull) / PCLK2_HZ))  /* 8533 */
+#define ADC_HOLD_NS  ((uint32_t)(((uint64_t)ADC_CONVERT_CYCLES \
+                                  * ADC_CLOCK_DIV * 1000000000ull) / PCLK2_HZ))  /* 1067 */
+
+/* Where the averaged value sits in time, measured back from the update tick.
+ *
+ * The sum covers the ADC_AVG_SAMPLES most recent *completed* conversions. Each
+ * one holds the input at the end of its sampling phase, ADC_HOLD_NS before it
+ * completes. The last one completed some time d before the tick, d uniform over
+ * one conversion because the ADC free-runs against the tick. The centroid of
+ * the window is therefore
+ *
+ *     d + ADC_HOLD_NS + (ADC_AVG_SAMPLES - 1) / 2 * ADC_CONV_NS
+ *
+ * and with d at its mean of ADC_CONV_NS / 2 that is
+ * ADC_AVG_SAMPLES / 2 * ADC_CONV_NS + ADC_HOLD_NS = 51.2 + 1.07 = 52.3 us. The
+ * spread of d is +/-4.3 us around it: under SSI4's 10 us TS resolution, but
+ * not under SSI9's 1 us. */
+#define ADC_WINDOW_DELAY_NS  ((ADC_AVG_SAMPLES * ADC_CONV_NS) / 2u + ADC_HOLD_NS)
+
 /* ADC1 -> DMA2 Stream 0, channel 0 (RM0390 Rev 9 Table 29). Stream 4 carries
  * the same request; streams 3/7 are taken by the slave's DATA path. */
 #define ADC_DMA_STREAM   DMA2_Stream0
@@ -54,7 +80,11 @@ static DMA_HandleTypeDef s_adc_dma;
 
 static volatile uint16_t s_samples[ADC_AVG_SAMPLES];
 static volatile bool     s_adc_running;
-static volatile uint32_t s_adc_conversions;
+/* The averaging window has been filled since the ADC (re)started. A flag, not
+ * a count: a conversion counter wraps, and one that was compared against
+ * ADC_AVG_SAMPLES dropped PV for one window every ~10 hours. */
+static volatile bool     s_adc_filled;
+static volatile uint32_t s_adc_overruns;
 
 static position_source_t s_src = POS_SRC_ADC;
 static uint32_t          s_fixed;
@@ -66,8 +96,9 @@ static void tim_init(void)
     __HAL_RCC_TIM2_CLK_ENABLE();
 
     /* TIM2 sits on APB1; with the APB1 prescaler != 1 its clock is 90 MHz.
-     * It no longer triggers the ADC -- that free-runs now -- but it still
-     * paces the position update at the rate 4.12 specifies. */
+     * It does not trigger the ADC -- that free-runs -- it only paces the
+     * position update at the rate 4.12 specifies, through its update
+     * interrupt. The ADC and this tick are not in step. */
     s_tim.Instance               = TIM2;
     s_tim.Init.Prescaler         = (APB1_TIMCLK_HZ / 1000000u) - 1u;  /* 1 MHz */
     s_tim.Init.CounterMode       = TIM_COUNTERMODE_UP;
@@ -75,12 +106,6 @@ static void tim_init(void)
     s_tim.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     s_tim.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     HAL_TIM_Base_Init(&s_tim);
-
-    /* Update event drives TRGO, which is what starts each ADC conversion. */
-    TIM_MasterConfigTypeDef mc = {0};
-    mc.MasterOutputTrigger = TIM_TRGO_UPDATE;
-    mc.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    HAL_TIMEx_MasterConfigSynchronization(&s_tim, &mc);
 }
 
 static void adc_init(void)
@@ -101,7 +126,7 @@ static void adc_init(void)
     HAL_DMA_Init(&s_adc_dma);
     __HAL_LINKDMA(&s_adc, DMA_Handle, s_adc_dma);
 
-    /* ADC clock = PCLK2 / 8 = 11.25 MHz, inside the 36 MHz maximum. */
+    /* ADC clock = PCLK2 / ADC_CLOCK_DIV = 11.25 MHz, inside the 36 MHz maximum. */
     s_adc.Instance                   = ANGLE_ADC;
     s_adc.Init.ClockPrescaler        = ADC_CLOCK_SYNC_PCLK_DIV8;
     s_adc.Init.Resolution            = ADC_RESOLUTION_12B;
@@ -168,7 +193,7 @@ const char *position_source_name(position_source_t src)
     case POS_SRC_ADC:   return "adc";
     case POS_SRC_FIXED: return "fixed";
     case POS_SRC_RAMP:  return "ramp";
-    default:            return "?";
+    default:            return "?"; 
     }
 }
 
@@ -197,6 +222,16 @@ static uint32_t adc_sum(void)
 }
 
 #define ADC_SUM_FULL_SCALE  (ADC_AVG_SAMPLES * 4095u)
+
+uint32_t position_source_delay_us(void)
+{
+    /* Synthetic sources have no measurement window: their value is the value
+     * at the tick. */
+    if (s_src != POS_SRC_ADC) {
+        return 0u;
+    }
+    return (ADC_WINDOW_DELAY_NS + 500u) / 1000u;
+}
 
 uint16_t position_source_raw_adc(void)
 {
@@ -255,16 +290,40 @@ bool position_source_valid(void)
 {
     /* Synthetic sources are always valid. The analog source only becomes valid
      * once the DMA has filled the averaging window; before that PV must be 0,
-     * which matches the IncOder's "Power Up Time To 1st Measurement". */
+     * which matches the IncOder's "Power Up Time To 1st Measurement".
+     *
+     * It also stops being valid on an overrun. In DMA mode an overrun blocks
+     * the ADC's DMA requests [RM0390 Rev 9 13.8.1], so the window freezes on
+     * its last values. Without this check the frames would go on reporting a
+     * frozen position with PV=1. position_source_service() restarts it. */
     if (s_src != POS_SRC_ADC) {
         return true;
     }
-    return s_adc_conversions >= ADC_AVG_SAMPLES;
+    return s_adc_filled && (ANGLE_ADC->SR & ADC_SR_OVR) == 0u;
+}
+
+void position_source_service(void)
+{
+    if (!s_adc_running || (ANGLE_ADC->SR & ADC_SR_OVR) == 0u) {
+        return;
+    }
+
+    /* PV stays 0 until the restarted DMA has filled a whole window again.
+     * HAL_ADC_Start_DMA() clears OVR itself. */
+    s_adc_filled = false;
+    HAL_ADC_Stop_DMA(&s_adc);
+    HAL_ADC_Start_DMA(&s_adc, (uint32_t *)s_samples, ADC_AVG_SAMPLES);
+    s_adc_overruns++;
+}
+
+uint32_t position_source_overruns(void)
+{
+    return s_adc_overruns;
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
     if (hadc->Instance == ANGLE_ADC) {
-        s_adc_conversions += ADC_AVG_SAMPLES;
+        s_adc_filled = true;
     }
 }

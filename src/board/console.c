@@ -175,6 +175,9 @@ static void cmd_stat(void)
         trace_printf("  short = master sent n clocks, not n+1 (5.4.1 Trc = nT+T/2):\r\n"
                      "  it reads the frame shifted one bit, Error Flag never clocked\r\n");
     }
+    trace_printf("refresh=%lu skipped=%lu adc_ovr=%lu\r\n",
+                 (unsigned long)ss.refreshed, (unsigned long)ss.refresh_skipped,
+                 (unsigned long)position_source_overruns());
     trace_printf("data_line_idle_high=%u  measured_T=%luns  tmu_arm=%luns\r\n",
                  (unsigned)ssi_master_data_idle_high(),
                  (unsigned long)ss.period_ns, (unsigned long)ss.tmu_arm_ns);
@@ -233,23 +236,16 @@ static void cmd_burst(uint32_t count, uint32_t gap_us)
         gap_us = 25u;      /* Timg must exceed Tmu = 20 us */
     }
 
-    /* Two warm-up cycles, not one. A frame is staged at the end of Tmu, so
-     * after a value change the *first two* cycles can still carry the old
-     * payload: cycle 0 was staged before the change, and cycle 1 may have been
-     * staged before the console command finished. Taking the reference from
-     * cycle 1 made every subsequent correct frame count as bad -- an ok=1
-     * bad=38 that looked like a link failure and was purely this. */
-    const uint32_t warmup = (count > 2u) ? 2u : 0u;
-
+    /* No warm-up cycles. They used to be needed because a frame was staged
+     * only at the end of Tmu, so the first cycles after a `fixed` carried the
+     * value from before it. The update tick now refreshes the idle frame, and
+     * a console command is far more than one update period old by the time
+     * this runs, so cycle 0 already carries it. */
     for (uint32_t i = 0; i < count; i++) {
         ssi_variant_t v = incoder_variant();
         uint32_t raw = 0;
         bool     ef  = false;
         bool got = ssi_master_read_timer(ssi_variant_frame_bits(v), &raw, &ef);
-        if (i < warmup) {
-            ssi_master_delay_us(gap_us);
-            continue;
-        }
         if (!got) {
             bad++;
         } else {
