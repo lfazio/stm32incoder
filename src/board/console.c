@@ -120,8 +120,8 @@ void console_banner(void)
                  (unsigned)ssi_variant_frame_bits(incoder_variant()));
     trace_printf("SSI master(test): CLK=PB10(D6) DATA=PB14(CN10-28) @ %lu Hz\r\n",
                  (unsigned long)ssi_master_exact_hz());
-    trace_printf("angle in : PA0 (A0), 0..VDDA -> 0..%lu counts\r\n",
-                 (unsigned long)((1u << ssi_variant_position_bits(incoder_variant())) - 1u));
+    trace_printf("angle in : PA0 (A0), 0..VDDA = 1 electrical turn, %lu pole pairs\r\n",
+                 (unsigned long)position_source_pole_pairs());
     trace_printf("type 'help' for commands\r\n");
 }
 
@@ -135,6 +135,7 @@ static void cmd_help(void)
     trace_printf("  src adc|fixed|ramp   position source; adc is the default\r\n");
     trace_printf("  fixed <counts>       fixed position, width follows the variant\r\n");
     trace_printf("  ramp <step>          counts per 100us update, selects 'ramp'\r\n");
+    trace_printf("  pp <n>               pole pairs 1..64; PA0 span = 1/n turn, 12 default\r\n");
     trace_printf("  zero set|reset       zero point; reset restores factory (ZPD=1)\r\n");
     trace_printf("  err on|off           force PV=0; makes D31 a meaningful test bit\r\n");
     trace_printf("  ssi 1|2|4|6|9        payload variant; 4 is the default\r\n");
@@ -162,8 +163,10 @@ static void cmd_stat(void)
                  (unsigned long)st.position, (unsigned)st.timestamp,
                  (unsigned)st.valid, (unsigned)st.zero_default,
                  (unsigned long)st.updates);
-    trace_printf("adc_raw=%u zero_off=%lu dropped=%lu\r\n",
+    trace_printf("adc_raw=%u pp=%lu eturn=%lu zero_off=%lu dropped=%lu\r\n",
                  (unsigned)position_source_raw_adc(),
+                 (unsigned long)position_source_pole_pairs(),
+                 (unsigned long)position_source_elec_turn(),
                  (unsigned long)incoder_zero_offset(),
                  (unsigned long)trace_dropped());
     trace_printf("reads: full=%lu short=%lu aborted=%lu\r\n",
@@ -322,6 +325,18 @@ static void handle_line(char *line)
         position_source_set_ramp_step(step);
         position_source_select(POS_SRC_RAMP);
         trace_printf("ramp step = %ld\r\n", (long)step);
+    } else if (strcmp(cmd, "pp") == 0 && arg != NULL) {
+        uint32_t pairs;
+        if (!parse_u32(arg, &pairs)) {
+            trace_printf("bad number '%s'\r\n", arg);
+            return;
+        }
+        if (!position_source_set_pole_pairs(pairs)) {
+            trace_printf("pole pairs must be 1..64\r\n");
+            return;
+        }
+        trace_printf("pole pairs = %lu (PA0 0..VDDA = 1/%lu turn)\r\n",
+                     (unsigned long)pairs, (unsigned long)pairs);
     } else if (strcmp(cmd, "zero") == 0 && arg != NULL) {
         if (strcmp(arg, "set") == 0) {
             incoder_zero_set();

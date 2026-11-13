@@ -5,10 +5,14 @@
  * runtime from the console.
  *
  * Mapping of the analog input to position is a choice of this emulator, not a
- * value from the IncOder specification: the full ADC span (0 V .. VDDA) maps
- * linearly onto one turn, i.e. 0 V = 0 counts = 0 deg and VDDA = 2^19 counts
- * = 360 deg, the same angle as 0 V. One ADC code is 128 counts of the 19-bit
- * SSI4 field; the 12-sample average refines that to 10.7.
+ * value from the IncOder specification. The analog input is the *electrical*
+ * angle of a motor with pole_pairs pole pairs (12 by default): the full ADC
+ * span (0 V .. VDDA) is one electrical turn, and VDDA is the same angle as
+ * 0 V. One electrical turn is 1/pole_pairs of a mechanical turn, and the
+ * encoder reports the mechanical angle, so the emulator counts the electrical
+ * turns and reports (k + electrical) / pole_pairs. One ADC code is
+ * 2^19 / 4096 / pole_pairs counts of the 19-bit SSI4 field, 10.7 at 12 pairs;
+ * with one pole pair it is 128, and VDDA = 2^19 counts = 360 deg.
  *
  * Because 0 V and VDDA are one angle, the average is taken on the circle
  * (circular_mean.h): an input ramp that wraps from one end of the ADC span to
@@ -49,7 +53,22 @@ void position_source_set_ramp_step(int32_t counts_per_update);
 /* Circular mean of the ADC averaging window in codes, 0..4095, for tracing. */
 uint16_t position_source_raw_adc(void);
 
-/* Current 19-bit position, already clamped to the SSI4 field width. */
+/* Pole pairs of the motor whose electrical angle PA0 carries, 1..64; 12 at
+ * power-on. Setting it restarts the electrical turn count at 0. Returns false,
+ * changing nothing, outside 1..64. Synthetic sources are not affected: their
+ * values are already mechanical counts. */
+bool     position_source_set_pole_pairs(uint32_t pairs);
+uint32_t position_source_pole_pairs(void);
+
+/* Electrical turn the analog input is in, 0 .. pole_pairs - 1, for tracing. */
+uint32_t position_source_elec_turn(void);
+
+/* Current mechanical position, already clamped to the variant's field width.
+ *
+ * Stateful for the analog source: it counts the electrical turns between one
+ * call and the next. Call it only from the update tick (incoder_update()); a
+ * call from the main loop could be preempted by the tick halfway through and
+ * then write back a stale turn count. */
 uint32_t position_source_read(void);
 
 /* True when the selected source has produced at least one usable value and

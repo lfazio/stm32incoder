@@ -55,6 +55,20 @@
  * not under SSI9's 1 us. */
 #define ADC_WINDOW_DELAY_NS  ((ADC_AVG_SAMPLES * ADC_CONV_NS) / 2u + ADC_HOLD_NS)
 
+/* Pole pairs of the motor whose electrical angle the analog input carries.
+ * Not a hardware value from docs/: it is the user's motor, which has 12. The
+ * console changes it at runtime (`pp <n>`).
+ *
+ * The ceiling keeps the scaling in 32 bits: the mechanical sum is under
+ * POLE_PAIRS_MAX * ADC_TURN_SUM = 64 * 49152 < 2^22, and it is shifted left by
+ * at most 22 - 12 = 10. */
+#define POLE_PAIRS_DEFAULT  12u
+#define POLE_PAIRS_MAX      64u
+
+/* One electrical turn in units of the averaging-window sum: VREF+ is code
+ * CIRCULAR_TURN, and the sum adds ADC_AVG_SAMPLES of them. */
+#define ADC_TURN_SUM  (CIRCULAR_TURN * ADC_AVG_SAMPLES)   /* 49152 */
+
 /* ADC1 -> DMA2 Stream 0, channel 0 (RM0390 Rev 9 Table 29). Stream 4 carries
  * the same request; streams 3/7 are taken by the slave's DATA path. */
 #define ADC_DMA_STREAM   DMA2_Stream0
@@ -91,6 +105,13 @@ static position_source_t s_src = POS_SRC_ADC;
 static uint32_t          s_fixed;
 static int32_t           s_ramp_step = 64;
 static uint32_t          s_ramp;
+
+/* Electrical-turn tracking. The update tick is the only writer, except
+ * position_source_set_pole_pairs(), which writes with interrupts masked. */
+static uint32_t s_pole_pairs = POLE_PAIRS_DEFAULT;
+static uint32_t s_elec_turn;      /* k, 0 .. s_pole_pairs - 1 */
+static uint32_t s_prev_sum;       /* last window sum, 0 .. ADC_TURN_SUM - 1 */
+static bool     s_have_prev;      /* s_prev_sum belongs to a valid window */
 
 static void tim_init(void)
 {
@@ -208,6 +229,33 @@ void position_source_set_ramp_step(int32_t counts_per_update)
     s_ramp_step = counts_per_update;
 }
 
+bool position_source_set_pole_pairs(uint32_t pairs)
+{
+    if (pairs == 0u || pairs > POLE_PAIRS_MAX) {
+        return false;
+    }
+
+    /* The update tick reads all three; it must never see a turn index from
+     * the old pole count against the new one. */
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_pole_pairs = pairs;
+    s_elec_turn  = 0u;
+    s_have_prev  = false;
+    __set_PRIMASK(primask);
+    return true;
+}
+
+uint32_t position_source_pole_pairs(void)
+{
+    return s_pole_pairs;
+}
+
+uint32_t position_source_elec_turn(void)
+{
+    return s_elec_turn;
+}
+
 /* Sum of the averaging window taken on the circle (circular_mean.h): divided by
  * ADC_AVG_SAMPLES it is the window's circular mean in ADC codes, modulo one
  * turn, somewhere in 0 .. 2 turns.
@@ -249,6 +297,43 @@ void position_source_tick(void)
     if (s_src == POS_SRC_RAMP) {
         s_ramp = (uint32_t)((int32_t)s_ramp + s_ramp_step) & s_pos_mask;
     }
+    /* The turn tracking compares consecutive windows. One taken before the
+     * source left `adc` says nothing about where the input is now. */
+    if (s_src != POS_SRC_ADC) {
+        s_have_prev = false;
+    }
+}
+
+/* Counts the electrical turns the analog input has made, from one update to the
+ * next, and returns k + sum / ADC_TURN_SUM as a sum: the mechanical angle in
+ * electrical-turn units, 0 .. pole_pairs * ADC_TURN_SUM - 1.
+ *
+ * The step between two windows is taken on the shortest arc, so a crossing of
+ * 0 V / VDDA in either direction moves k by one, and a noise spike that crosses
+ * and comes back moves it twice and cancels. That only holds while the input
+ * moves less than half an electrical turn per update period: under 5 kHz
+ * electrical, 25 000 rpm at 12 pole pairs.
+ *
+ * Only the update tick may call this (through position_source_read()). */
+static uint32_t track_elec_turn(uint32_t sum, uint32_t pairs)
+{
+    /* Two windows from either side of the ADC filling up, or of an overrun,
+     * have nothing to do with each other. */
+    if (!position_source_valid()) {
+        s_have_prev = false;
+    } else if (s_have_prev) {
+        const int32_t d = (int32_t)sum - (int32_t)s_prev_sum;
+        if (d < -(int32_t)(ADC_TURN_SUM / 2u)) {
+            s_elec_turn = (s_elec_turn + 1u) % pairs;            /* forward through 0 */
+        } else if (d > (int32_t)(ADC_TURN_SUM / 2u)) {
+            s_elec_turn = (s_elec_turn + pairs - 1u) % pairs;    /* backward through 0 */
+        }
+        s_prev_sum = sum;
+    } else {
+        s_prev_sum  = sum;
+        s_have_prev = true;
+    }
+    return s_elec_turn * ADC_TURN_SUM + sum;
 }
 
 uint32_t position_source_read(void)
@@ -260,7 +345,17 @@ uint32_t position_source_read(void)
         return s_ramp;
     case POS_SRC_ADC:
     default: {
-        /* Scale the circular mean onto the position field.
+        /* The analog input is the motor's electrical angle: 0 V .. VREF+ is
+         * one electrical turn, 1/pole_pairs of a mechanical one. The encoder
+         * reports the mechanical angle, (k + electrical) / pole_pairs, with k
+         * the electrical turn counted by track_elec_turn(). It runs on through
+         * every electrical turn and wraps only once per pole_pairs of them, so
+         * a controller that computes pole_pairs * mechanical gets the input
+         * back, with no jump in speed when the input wraps. Which k the
+         * emulator starts on is arbitrary, like where a real encoder is
+         * clamped onto the shaft; the electrical angle does not depend on it.
+         *
+         * Scale the circular mean onto the position field.
          *
          * 1 LSB is VREF+/4096, and on the ideal transfer curve the
          * transitions sit at 0.5, 1.5, ... 4094.5 LSB [DS10693 Rev 11
@@ -284,12 +379,19 @@ uint32_t position_source_read(void)
          * honest bits would need 4^7 = 16384 samples per update, which does
          * not fit a 100 us period.
          *
-         * Rounded to nearest. The mask folds the circular mean, which can sit
-         * up to two turns up, back into one turn. 32 bits are enough: the sum
-         * is under 2 * 4096 * 12 < 2^17, and shifted by at most 10. */
-        const uint32_t sum = adc_sum();
-        return (((sum << (s_pos_bits - 12u)) + ADC_AVG_SAMPLES / 2u)
-                / ADC_AVG_SAMPLES) & s_pos_mask;
+         * With pole pairs, one ADC code is 2^(bits - 12) / pole_pairs counts
+         * (10.7 at 19 bits and 12 pairs) and the sum's step is 1/12 of that.
+         * The scaling below divides by ADC_AVG_SAMPLES * pole_pairs; with one
+         * pole pair it is the one-turn mapping above, bit for bit.
+         *
+         * Rounded to nearest. The circular sum can sit up to two turns up, so
+         * it is folded into one electrical turn before the turns are counted.
+         * 32 bits are enough: the mechanical sum is under
+         * POLE_PAIRS_MAX * ADC_TURN_SUM < 2^22, and shifted by at most 10. */
+        const uint32_t pairs = s_pole_pairs;
+        const uint32_t mech  = track_elec_turn(adc_sum() % ADC_TURN_SUM, pairs);
+        const uint32_t div   = ADC_AVG_SAMPLES * pairs;
+        return (((mech << (s_pos_bits - 12u)) + div / 2u) / div) & s_pos_mask;
     }
     }
 }

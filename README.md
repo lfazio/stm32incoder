@@ -97,6 +97,7 @@ terminated; `printf 'stat\r' > /dev/ttyACM0` works while a reader holds the port
 | `src adc\|fixed\|ramp` | select the position source |
 | `fixed <counts>` | fixed position, 0…524287; also selects `fixed` |
 | `ramp <step>` | counts added per 100 µs update; also selects `ramp` |
+| `pp <n>` | motor pole pairs, 1…64 (**12** at power-on): PA0's span is one electrical turn, 1/n of a mechanical one |
 | `zero set\|reset` | set the zero point here, or restore the factory one (ZPD=1) |
 | `err on\|off` | force PV=0, reporting the error condition |
 | `ssi 1\|2\|4\|6\|9` | select the payload variant; **SSI4 is the default** |
@@ -135,7 +136,7 @@ and three about the update path:
 | | Default |
 |---|---|
 | System clock | HSE if the ST-LINK MCO is strapped, else HSI — the banner says which, and flags `[timestamp OUT OF SPEC]` on the HSI fallback |
-| Position source | `adc` — PA0, 0…VDDA mapped onto one turn (128 counts per ADC code; VDDA ≡ 0) |
+| Position source | `adc` — PA0, 0…VDDA = one electrical turn of a **12 pole-pair** motor, i.e. 1/12 of a mechanical turn (10.7 counts per ADC code; VDDA ≡ 0) |
 | Zero point | factory, so ZPD = 1 |
 | PV | 1 (`err off`) |
 | SSI payload variant | **SSI4** — n = 32 bits, 19-bit position, 10 µs Time Stamp |
@@ -725,9 +726,21 @@ requests land on DMA2. No SPI is involved anywhere, at either end of the link.
 
   Scale a 5 V source with a divider instead, keeping the source impedance under
   the 50 kΩ `RAIN` limit: 5.1 kΩ / 10 kΩ gives 5 V → 3.31 V at ~3.4 kΩ.
-- **Analog → angle mapping.** 0 V…VDDA maps linearly onto one turn: code k is
+- **Analog → angle mapping.** PA0 carries a motor's *electrical* angle: 0 V…VDDA
+  is one electrical turn, and with p pole pairs (`pp`, 12 at power-on) that is
+  1/p of the mechanical turn the encoder reports. The emulator counts the
+  electrical turns k = 0…p−1 from one 100 µs update to the next, on the
+  shortest arc, and reports (k + electrical)/p. The mechanical position
+  therefore runs on through each electrical wrap and wraps itself only every
+  p of them, so a controller computing p × mechanical gets PA0's angle back
+  with no speed spike at the wrap. The k it starts from is arbitrary, like
+  where a real encoder is clamped onto the shaft. Tracking needs under half an
+  electrical turn per update: below 5 kHz electrical, 25 000 rpm at 12 pairs.
+  `fixed` and `ramp` are mechanical counts and ignore `pp`.
+
+  With one pole pair the mapping is the one-turn mapping: code k is
   k × 2^(bits−12) counts, 128 for SSI4's 19 bits and 1024 for the 22-bit
-  variants. DS10693 Figure 45 gives 1 LSB = VREF+/4096 with the ideal
+  variants, and p pole pairs divide that by p. DS10693 Figure 45 gives 1 LSB = VREF+/4096 with the ideal
   transitions at 0.5, 1.5 … 4094.5 LSB, so code k is centred on k/4096 of full
   scale, and VDDA is code 4096: a whole turn, the same angle as 0 V. Code 4095
   is therefore 524160, not 524287 — the counts above it are inside its bin. An

@@ -28,6 +28,11 @@ static volatile ssi_variant_t s_variant = SSI_VARIANT_DEFAULT;
 static volatile uint32_t s_zero_offset;
 static volatile bool     s_zero_default = true;
 static volatile bool     s_force_error;
+/* The source's raw position at the last update, before the zero offset. The
+ * zero commands take it from here rather than calling position_source_read()
+ * from the main loop: that call counts electrical turns, and the update tick
+ * preempting it halfway would have it write back a stale count. */
+static volatile uint32_t s_raw;
 
 static void timestamp_timer_init(void)
 {
@@ -120,6 +125,7 @@ void incoder_update(void)
     const uint16_t now  = incoder_timestamp_now();
     const uint32_t raw  = position_source_read();
     const uint32_t mask = (1u << ssi_variant_position_bits(v)) - 1u;
+    s_raw = raw;
 
     /* The zero commands write offset and ZPD with interrupts masked, so this
      * tick can never see one without the other. */
@@ -164,8 +170,9 @@ static void zero_write(uint32_t offset, bool is_default)
 
 void incoder_zero_set(void)
 {
-    /* Make the current raw position read as zero. */
-    zero_write(position_source_read(), false);
+    /* Make the current raw position read as zero: the last update's, at most
+     * one update period old. */
+    zero_write(s_raw, false);
 }
 
 void incoder_zero_reset(void)
